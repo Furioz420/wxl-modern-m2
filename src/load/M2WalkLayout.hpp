@@ -208,4 +208,11 @@ namespace wxl::runtime::m2native::detail
         { offsetof(structure::m2::M2Header, particleEmitters),     0x1DC, kArrayPlain,         kParticleSteps,         StepCount(kParticleSteps) },
         { offsetof(structure::m2::M2Header, textureCombinerCombos), 0x02, kArrayCombinerGated, nullptr, 0 },
     };
+
+    inline constexpr const HeaderArray* HeaderArrayFor(uint32_t at)
+    {
+        for (const HeaderArray& entry : kHeaderArrays)
+            if (entry.at == at) return &entry;
+        return nullptr;
+    }
 }

@@ -45,11 +45,11 @@ namespace wxl::runtime::m2native::detail
     {
         std::memset(&s, 0, sizeof s);
         uint32_t offV = 0;
-        while (offV + 8 <= size)
+        while (offV <= size && size - offV >= 8)
         {
             const uint32_t tag = Rd32(buf + offV);
             const uint32_t sz  = Rd32(buf + offV + 4);
-            if (sz > size || offV + 8 + sz > size) break; // malformed tail; keep what we have
+            if (sz > size - offV - 8) break; // malformed tail; keep what we have
             const uint8_t* payload = buf + offV + 8;
 
             switch (tag)
@@ -73,13 +73,18 @@ namespace wxl::runtime::m2native::detail
             case Tag("TXAC"): s.skipMask |= kSkipTxac; break;
             case Tag("LDV1"): s.skipMask |= kSkipLdv1; break;
             case Tag("AFID"): s.skipMask |= kSkipAfid; break;
-            case Tag("SKID"): s.skipMask |= kSkipSkid; break;
+            case Tag("SKID"):
+                if (sz >= 4) s.skid = Rd32(payload);
+                s.skipMask |= kSkipSkid;
+                break;
             case Tag("PFID"):
             case Tag("BFID"): s.skipMask |= kSkipPhysBone; break;
             default:          s.skipMask |= kSkipOther; break;
             }
             offV += 8 + sz;
         }
+        // Preserve existing load tolerance, but mark incomplete feature coverage for opt-in renderers.
+        if (offV != size) s.skipMask |= kSkipOther;
         return s.bodyOff != 0 && s.bodySize >= sizeof(fmt::M2Header) &&
                s.bodyOff + s.bodySize <= size;
     }

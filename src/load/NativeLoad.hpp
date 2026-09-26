@@ -39,9 +39,11 @@ namespace wxl::runtime::m2native
         uint32_t skippedTxac;        ///< models carrying a TXAC chunk (no home in the client's format; logged skip)
         uint32_t skippedLdv1;        ///< models carrying LDV1 LOD-skin data (profile 0 only in Phase 1)
         uint32_t skippedAfid;        ///< models carrying AFID (external .anim ids; Phase 2)
-        uint32_t skippedSkid;        ///< models carrying SKID (.skel skeleton; Phase 3 -- load refused)
+        uint32_t skippedSkid;        ///< models carrying SKID (bones/sequences live in a companion .skel)
         uint32_t skippedOtherChunks; ///< models carrying any other auxiliary chunk (EXP2, PFDC, ...)
         uint32_t externalSeqPending; ///< sequences seen whose data streams from a .anim file (Phase 2)
+        uint32_t skeletonsSpliced;   ///< models whose bones/sequences came from a companion .skel
+        uint32_t skeletonsParented;  ///< split skeletons inheriting a parent animation set
         /// Models whose shared runtime's shadow-animate gate was zero and had to be lifted to 1.
         /// A modern M2 ships every bone flag at 0x0, which would send the shadow pass down an animate
         /// fast path that never refreshes the bone palette -- the cause of shadows tracking the camera.
@@ -73,4 +75,6 @@ namespace wxl::runtime::m2native
      * @return 1 on success, 0 on failure -- the stock parser's own result contract.
      */
     int NativeLoad(void* model);
+
+    void ReleaseSkeleton(void* model);
 }

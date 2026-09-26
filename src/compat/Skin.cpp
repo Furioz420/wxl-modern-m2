@@ -15,6 +15,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "Skin.hpp"
+#include "SourceMaterialCapture.hpp"
+#include "MaterialLightingPolicy.hpp"
+#include "MaterialConfig.hpp"
+#include "RiftMeshPolicy.hpp"
 
 #include "../ExtensionApi.hpp"
 #include "../render/CombinerPatch.hpp"
@@ -326,11 +330,19 @@ namespace wxl::modern::assets::m2::skin
          * @param blendOverride       textureCombinerCombos array to append into.
          * @param nTransparencyLookup Count of transparency-lookup entries.
          */
-        void FixTexUnits(Skin* skin, const std::vector<uint8_t>& badSubmesh,
+        void FixTexUnits(fmt::M2Header* md, Skin* skin, const std::vector<uint8_t>& badSubmesh,
                          const std::vector<bn::SplitRun>& splitMap, std::vector<fmt::M2Batch>& out,
                          std::vector<int16_t>& texUnitLookup, std::vector<uint16_t>& blendOverride,
-                         uint32_t nTransparencyLookup, uint32_t nTransformLookup)
+                         uint32_t nTransparencyLookup, uint32_t nTransformLookup, const char* name,
+                         material::SkinSource* source)
         {
+            const auto* textures = md && md->textures.count && md->textures.offset
+                ? reinterpret_cast<const fmt::M2Texture*>(static_cast<uintptr_t>(md->textures.offset))
+                : nullptr;
+            const auto* textureCombos = md && md->textureCombos.count && md->textureCombos.offset
+                ? reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(md->textureCombos.offset))
+                : nullptr;
+
             out.reserve(skin->batchCount);
             for (uint32_t i = 0; i < skin->batchCount; ++i)
             {
@@ -339,6 +351,43 @@ namespace wxl::modern::assets::m2::skin
                 bn::SplitRun run{ b.skinSectionIndex, 1 };
                 if (b.skinSectionIndex < splitMap.size()) run = splitMap[b.skinSectionIndex];
 
+                // Female Orc's actual eyeball is customization group 33. Its modern batch names the
+                // same replaceable type-19 eye texture in both stages (shader 0x4013). Letting the
+                // general down-converter preserve that as a two-stage combiner leaves the WotLK
+                // material cache with a black socket. Collapse this exact signature before native
+                // finalization/material preparation; changing the live batch later is too late because
+                // the client has already cached the original texture-stage program.
+                const uint32_t sectionIndex = run.first;
+                const bool femaleOrcEye = name &&
+                    (std::strstr(name, "orc\\female") || std::strstr(name, "Orc\\Female"));
+                const bool baseEyeSection = sectionIndex < skin->submeshCount &&
+                    skin->submeshes[sectionIndex].skinSectionId / 100 == 33;
+                const uint32_t combo = b.textureComboIndex;
+                if (femaleOrcEye && baseEyeSection && textures && textureCombos &&
+                    b.textureCount >= 2 &&
+                    combo + 1 < md->textureCombos.count)
+                {
+                    const uint16_t first = textureCombos[combo];
+                    const uint16_t second = textureCombos[combo + 1];
+                    if (first == second && first < md->textures.count && textures[first].type == 19)
+                    {
+                        b.textureCount = 1;
+                        b.shaderId = 0x0010;
+                        WLOG_INFO("char-eyes: '%s' collapsed base-eye batch=%u section=%u texture=%u before finalize",
+                                  name ? name : "(unnamed)", i,
+                                  skin->submeshes[sectionIndex].skinSectionId, first);
+                    }
+                }
+
+                // Isolated mesh-only test: effect 33 is Mod_Mod2x, not AddAlpha.
+                // Preserve the source snapshot; only the native translation input changes.
+                const bool riftCorrected=riftmesh::Eligible(
+                    wxl::modern::materialconfig::Feature("WXL_M2_RIFT_MESH_COMBINER"),name?name:"",
+                    source&&source->model?source->model.get():nullptr,b);
+                if(riftCorrected) {
+                    b.shaderId=riftmesh::kPackedModMod2x;
+                    WLOG_INFO("m2-rift-mesh: model='%s' sourceBatch=%u sourceShader=0x8021 packedShader=0x4014 textures=2 combiner=Mod_Mod2x nativeUV=0,1 addAlpha=0 edgeFade=0",name,i);
+                }
                 std::vector<fmt::M2Batch> piece;
                 bool isAddAlpha = false;
                 DownConvertBatch(b, nTransparencyLookup, nTransformLookup, piece, texUnitLookup, blendOverride,
@@ -354,8 +403,12 @@ namespace wxl::modern::assets::m2::skin
                         nb.skinSectionIndex = sectionIdx;
                         if (bad) nb.shaderId = 0x8000;
                         out.push_back(nb);
+                        material::SourceMaterialStore::Append(source, i,
+                            static_cast<uint16_t>(&p - piece.data()), s, sectionIdx, bad);
                         if (isAddAlpha && !bad)
                             combiner::MarkAddAlphaBatch(skin, static_cast<uint32_t>(out.size() - 1));
+                        else if(riftCorrected)
+                            combiner::UnmarkAddAlphaBatch(skin, static_cast<uint32_t>(out.size() - 1));
                     }
                 }
             }
@@ -430,6 +483,10 @@ namespace wxl::modern::assets::m2::skin
     {
         if (!md || !skin) return;
 
+        // Snapshot the untouched SKIN records, including material indices and all combo bases.
+        // Only a raw-loader-registered owner can produce a draft; stock assets stay untouched.
+        auto source = material::SourceMaterials().Begin(md, skin, skin->batches, skin->batchCount);
+
         if (skin->batchCount > bn::kMaxBatches)
         {
             WLOG_WARN("modern-m2: '%s' skin batchCount=%u exceeds cap, clamping", name, skin->batchCount);
@@ -449,8 +506,8 @@ namespace wxl::modern::assets::m2::skin
         // skin->submeshes and combine the split re-point with this source's shaderId decode.
         const bool extendedIndexStart = bn::UsesExtendedIndexStart(name);
         FixSubmeshes(md, skin, badSubmesh, extendedIndexStart);
-        FixTexUnits(skin, badSubmesh, splitMap, batches, texUnitLookup, blendOverride,
-                    nTransparencyLookup, nTransformLookup);
+        FixTexUnits(md, skin, badSubmesh, splitMap, batches, texUnitLookup, blendOverride,
+                    nTransparencyLookup, nTransformLookup, name, source.get());
 
         // Commit the rebuilt batch array BEFORE native finalize sizes its parallel block from
         // skin->batchCount. The file-mapped arrays are never per-array freed, so the new buffer is leaked
@@ -463,6 +520,8 @@ namespace wxl::modern::assets::m2::skin
                 std::memcpy(buf, batches.data(), batches.size() * sizeof(fmt::M2Batch));
                 skin->batches    = buf;
                 skin->batchCount = static_cast<uint32_t>(batches.size());
+                // Publish only the array actually installed, never an uncommitted candidate.
+                material::SourceMaterials().Commit(std::move(source), buf, skin->batchCount);
             }
         }
 
@@ -490,5 +549,22 @@ namespace wxl::modern::assets::m2::skin
         }
 
         FixRenderFlags(md);
+        // Run before native material/shader setup. No per-draw shader substitution;
+        // the native client selects its normal lit program and fills its constants.
+        if(wxl::modern::materialconfig::Feature("WXL_M2_BLEND7_SOURCE_LIGHTING")&&md->materials.count<=256&&md->materials.offset) {
+            const auto captured=material::SourceMaterials().Find(md,skin,skin->batches,skin->batchCount);
+            auto* words=reinterpret_cast<uint16_t*>(static_cast<uintptr_t>(md->materials.offset));
+            const auto* combiners=reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(md->textureCombinerCombos.offset));
+            const auto* coords=reinterpret_cast<const int16_t*>(static_cast<uintptr_t>(md->textureUnitLookup.offset));
+            for(unsigned i=0;i<md->materials.count;++i) {
+                uint16_t flags=words[i*2];
+                if(material::RestoreAuthoredLighting(true,captured.get(),md->numSkinProfiles,skin->batches,skin->batchCount,
+                    i,flags,words[i*2+1],combiners,md->textureCombinerCombos.count,coords,md->textureUnitLookup.count,flags)) {
+                    WLOG_INFO("m2-source-lighting: model='%s' material=%u sourceBlend=7 liveBlend=4 flagsBefore=%#x flagsAfter=%#x sourceUnlit=0; native lighting selection requested, blend factors unchanged",
+                        name?name:"",i,unsigned(words[i*2]),unsigned(flags));
+                    words[i*2]=flags;
+                }
+            }
+        }
     }
 }

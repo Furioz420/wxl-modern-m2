@@ -16,6 +16,13 @@
 
 #pragma once
 
+#include <cstdint>
+
+namespace wxl::structure::m2
+{
+    struct M2Header;
+}
+
 /**
  * @brief The live-engine half of modern-M2 support: what the client must be taught to DO with a model the
  *        native MD21 reader (NativeLoad.cpp) filled, once the bytes are already in the runtime.
@@ -41,4 +48,14 @@ namespace wxl::modern::assets::m2
      * @param model Runtime model pointer.
      */
     void ForgetNativeLoaded(void* model);
+
+    bool IsNativeLoaded(void* model);
+
+    /**
+     * Moves attached retail-equipment UV tracks off the client-special
+     * global-loop slots 0/1 while preserving their authored durations.
+     */
+    uint32_t RepairEquipmentTextureLoops(
+        void* model, wxl::structure::m2::M2Header* header,
+        const char* path);
 }

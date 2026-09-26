@@ -23,16 +23,30 @@
 // for its own three slots, so a device recreate (not a Reset -- the vtable survives that) is covered.
 
 #include "../ExtensionApi.hpp"
+#include "../compat/ModernM2.hpp"
+#include "MaterialDiagnostics.hpp"
+#include "MaterialBlendExperiment.hpp"
+#include "ParticleDiagnostics.hpp"
+#include "ParticleLayers.hpp"
+#include "ParticleDrawTrace.hpp"
+#include "RibbonShader.hpp"
+#include "ShaderObjects.hpp"
+#include "ShadowSpace.hpp"
 
 #include "common/Mem.hpp"
 #include "engine/events/Event.hpp"
 #include "engine/assets/shared/models/m2/M2Format.hpp"
 #include "game/Gx.hpp"
+#include "game/M2.hpp"
 #include "offsets/engine/Gx.hpp"
 #include "offsets/game/M2.hpp"
 
 #include <windows.h>
 #include <d3d9.h>
+
+#include <cstring>
+#include <array>
+#include <intrin.h>
 
 namespace
 {
@@ -51,6 +65,12 @@ namespace
     using DrawBatchFn = void (__fastcall*)(void* ctx, void* edx);
     DrawBatchFn g_origDrawBatch = nullptr;
 
+    // The stock engine draw dispatcher divides the current vertex-buffer byte size by its stride at
+    // 0x006A366B without checking for zero. A partially initialized modern/fallback model can leave a
+    // wrapper bound with stride 0; skip that one malformed draw instead of terminating the client.
+    off::GxDeviceDrawFn g_origDeviceDraw = nullptr;
+    LONG                g_zeroStrideDrawSkips = 0;
+
     // Ribbon multi-texture: set true around a >= 3 layer ribbon's single native pass so the DIP override
     // folds its bound layers into one combine. The native ribbon draw is hooked separately below.
     m2off::M2_RibbonDrawFn g_origRibbonDraw = nullptr;
@@ -59,9 +79,92 @@ namespace
     // --- the DIP vtable slot itself ---------------------------------------------------------------
     WXL_M2Draw_DIPFn       g_origDIP      = nullptr;
     WXL_M2Draw_InterceptFn g_oneShot      = nullptr; // armed by wxl.m2draw's SetOneShotIntercept
-    void*                  g_hookedDevice = nullptr; // device whose vtable currently carries hkDIP
-
     void EnsureDIPHook(IDirect3DDevice9* dev);   // defined after the detours
+
+    // Default-off trace: eight whole Present intervals, spaced >=500ms, only after
+    // exact-target activity. Fixed CPU storage; COM references never survive a snapshot.
+    namespace pl=wxl::modern::particlelayers;
+    namespace dt=wxl::modern::drawtrace;
+    struct TraceRow {
+        dt::Snapshot gpu;
+        void* device=nullptr;void* instance=nullptr;void* shared=nullptr;void* ribbon=nullptr;
+        void* caller=nullptr;
+        char path[276]{};
+        unsigned kind=0,engine=0,dips=0,context=0,target=0,route=0,vertices=0,primitives=0;
+        int type=0,indexed=0,userMemory=-1;
+    };
+    std::array<TraceRow,2048> traceRows;
+    dt::Schedule traceSchedule;
+    unsigned traceCount=0,traceDropped=0,traceFrame=0,traceEngine=0,traceEngineRow=UINT_MAX;
+    bool traceCapture=false,traceTargetSeen=false;
+    void* traceRibbon=nullptr;
+    void TraceModel(TraceRow& row) noexcept {
+        row.instance=pl::TraceInstance();row.context=row.instance?1:0;
+        if(!row.instance&&g_curModel){row.instance=g_curModel;row.context=2;}
+        row.ribbon=traceRibbon;if(!row.context&&traceRibbon)row.context=3;
+        __try {
+            if(!row.instance)return;
+            row.shared=*reinterpret_cast<void**>(static_cast<uint8_t*>(row.instance)+m2off::kOffInstModel);
+            if(!row.shared)return;
+            const char* path=wxl::game::m2::M2Model(row.shared).GetPathStem();
+            if(!path)return;
+            size_t n=0;for(;n+1<sizeof(row.path)&&path[n];++n)row.path[n]=path[n];
+            if(path[n])strcpy_s(row.path,"<truncated>");
+        }__except(EXCEPTION_EXECUTE_HANDLER){strcpy_s(row.path,"<unreadable>");}
+    }
+    unsigned TraceDraw(void* device,void* caller,unsigned kind,int type,unsigned vertices,unsigned primitives,int indexed) {
+        if(!pl::TraceEnabled())return UINT_MAX;
+        if(pl::TraceTarget())traceTargetSeen=true;
+        if(!traceCapture)return UINT_MAX;
+        if(traceCount==traceRows.size()){++traceDropped;return UINT_MAX;}
+        const unsigned index=traceCount++;auto& row=traceRows[index];row=TraceRow{};
+        row.device=device;row.caller=caller;row.kind=kind;row.type=type;row.vertices=vertices;row.primitives=primitives;
+        row.indexed=indexed;row.engine=traceEngine;row.target=unsigned(pl::TraceTarget());
+        row.route=g_oneShot?1:g_ribbonModern?2:pl::Active()?3:0;
+        TraceModel(row);
+        row.gpu=dt::Read(static_cast<IDirect3DDevice9*>(device));
+        return index;
+    }
+    struct TraceEngineScope {
+        unsigned previous=traceEngine,previousRow=traceEngineRow;
+        TraceEngineScope(void* engineDevice,int* primitive,int indexed,void* caller) {
+            if(!pl::TraceEnabled()||!traceCapture)return;
+            traceEngine=traceCount+1;int type=-1,count=0,user=-1;
+            __try {
+                if(primitive){type=primitive[0];count=primitive[2];}
+                if(engineDevice)user=*reinterpret_cast<int*>(static_cast<uint8_t*>(engineDevice)+off::kDeviceDrawUserMemory);
+            }__except(EXCEPTION_EXECUTE_HANDLER){}
+            traceEngineRow=TraceDraw(gx::RawDevice(),caller,0,type,0,count<0?0u:unsigned(count),indexed);
+            if(traceEngineRow!=UINT_MAX)traceRows[traceEngineRow].userMemory=user;
+        }
+        ~TraceEngineScope(){traceEngine=previous;traceEngineRow=previousRow;}
+    };
+    void __cdecl TraceFrame(void*,const void* args) {
+        if(!pl::TraceEnabled())return;
+        const auto* frame=static_cast<const ev::FrameArgs*>(args);
+        if(traceCapture) {
+            const auto end=dt::Read(frame?static_cast<IDirect3DDevice9*>(frame->device):nullptr);
+            WLOG_INFO("m2-draw-trace: frame=%u packet=%u rows=%u dropped=%u targetSeen=%u presentDevice=%p presentRT=%p backbuffer=%p valid=%#x",traceFrame,traceSchedule.used,traceCount,traceDropped,unsigned(traceTargetSeen),frame?frame->device:nullptr,reinterpret_cast<void*>(end.rt),reinterpret_cast<void*>(end.backbuffer),end.valid);
+            for(unsigned n=0;n<traceCount;++n){const auto& r=traceRows[n];const auto& s=r.gpu;
+                WLOG_INFO("m2-draw-trace: frame=%u row=%u kind=%u engine=%u dips=%u context=%u target=%u route=%u device=%p caller=%p instance=%p shared=%p ribbon=%p path='%s' type=%d vertices=%u primitives=%u indexed=%d userMemory=%d",traceFrame,n,r.kind,r.engine,r.dips,r.context,r.target,r.route,r.device,r.caller,r.instance,r.shared,r.ribbon,r.path,r.type,r.vertices,r.primitives,r.indexed,r.userMemory);
+                WLOG_INFO("m2-draw-trace-gpu: frame=%u row=%u valid=%#x rt=%p rtTexture=%p backbuffer=%p size=%ux%u format=%u viewport=%u,%u,%u,%u tex0=%p tex1=%p tex2=%p vs=%p ps=%p colorWrite=%#lx zWrite=%lu zEnable=%lu",traceFrame,n,s.valid,reinterpret_cast<void*>(s.rt),reinterpret_cast<void*>(s.rtTexture),reinterpret_cast<void*>(s.backbuffer),s.desc.Width,s.desc.Height,unsigned(s.desc.Format),s.viewport.X,s.viewport.Y,s.viewport.Width,s.viewport.Height,reinterpret_cast<void*>(s.texture[0]),reinterpret_cast<void*>(s.texture[1]),reinterpret_cast<void*>(s.texture[2]),reinterpret_cast<void*>(s.vs),reinterpret_cast<void*>(s.ps),s.colorWrite,s.zWrite,s.zEnable);
+            }
+            WLOG_INFO("m2-draw-trace: end frame=%u rows=%u",traceFrame,traceCount);
+        }
+        ++traceFrame;traceCount=0;traceDropped=0;traceEngine=0;traceEngineRow=UINT_MAX;
+        traceCapture=traceSchedule.Next(GetTickCount(),traceTargetSeen);
+        traceTargetSeen=false;
+    }
+    void __cdecl TraceLost(void*,const void*) {
+        if(!pl::TraceEnabled())return;
+        WLOG_WARN("m2-draw-trace: device-lost frame=%u partialRows=%u; partial interval discarded",traceFrame,traceCount);
+        traceCapture=false;traceCount=0;traceDropped=0;traceTargetSeen=false;
+    }
+
+    // 0 = waiting for the exact first body draw, 1 = one render thread owns the readback, 2 = done.
+    // The render path is normally single-threaded, but an interlocked guard keeps this diagnostic
+    // one-shot even if a future scene driver submits from more than one worker.
+    volatile LONG g_orcFemaleD3DProbeState = 0;
 
     /**
      * @brief Detours the M2 batch draw, recording the drawing model so the per-draw event can name it.
@@ -77,6 +180,82 @@ namespace
         g_origDrawBatch(ctx, edx);
         g_curDrawCtx = prevCtx;
         g_curModel = prevModel;
+    }
+
+    /**
+     * @brief Rejects the exact zero-stride state that makes the stock device draw divide by zero.
+     *
+     * This intentionally mirrors the stock outer gates and leaves user-memory draws untouched. It
+     * does not repair or synthesize geometry: only the invalid draw is omitted, and later valid draws
+     * continue through the original dispatcher normally.
+     */
+    void DeviceDrawChecked(void* device, void* edx, int* primitiveBatch, int indexed)
+    {
+        bool     invalidStride = false;
+        void*    vertexBuffer  = nullptr;
+        uint32_t byteSize      = 0;
+
+        __try
+        {
+            const auto* base = static_cast<const uint8_t*>(device);
+            const bool stockWouldDraw =
+                *reinterpret_cast<const uint32_t*>(base + off::kDeviceDrawSceneActive) != 0 &&
+                *reinterpret_cast<const uint32_t*>(base + off::kDeviceDrawSuppressed) == 0;
+            const bool usesBoundVertexBuffer =
+                *reinterpret_cast<const uint32_t*>(base + off::kDeviceDrawUserMemory) == 0;
+
+            if (stockWouldDraw && usesBoundVertexBuffer)
+            {
+                vertexBuffer = *reinterpret_cast<void* const*>(
+                    base + off::kDeviceCurrentVertexBuffer);
+                if (vertexBuffer)
+                {
+                    const auto* vb = static_cast<const uint8_t*>(vertexBuffer);
+                    const uint32_t stride = *reinterpret_cast<const uint32_t*>(
+                        vb + off::kVertexBufferStride);
+                    byteSize = *reinterpret_cast<const uint32_t*>(
+                        vb + off::kVertexBufferByteSize);
+                    invalidStride = stride == 0;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // Preserve native behavior for any state other than the confirmed zero-stride case.
+            invalidStride = false;
+        }
+
+        if (invalidStride)
+        {
+            const LONG skipped = InterlockedIncrement(&g_zeroStrideDrawSkips);
+            if (skipped <= 16 || (skipped & (skipped - 1)) == 0)
+            {
+                int primitive = -1;
+                int count = -1;
+                __try
+                {
+                    if (primitiveBatch)
+                    {
+                        primitive = primitiveBatch[0];
+                        count = primitiveBatch[2];
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                WLOG_WARN("m2-draw: skipped zero-stride engine draw #%ld "
+                          "(vb=%p bytes=%u batch=%p primitive=%d count=%d indexed=%d model=%p)",
+                          skipped, vertexBuffer, byteSize, static_cast<void*>(primitiveBatch),
+                          primitive, count, indexed, g_curModel);
+            }
+            return;
+        }
+
+        g_origDeviceDraw(device, edx, primitiveBatch, indexed);
+    }
+    void __fastcall hkDeviceDraw(void* device,void* edx,int* primitiveBatch,int indexed)
+    {
+        TraceEngineScope trace(device,primitiveBatch,indexed,_ReturnAddress());
+        DeviceDrawChecked(device,edx,primitiveBatch,indexed);
     }
 
     /**
@@ -114,6 +293,355 @@ namespace
         {
             return startIndex;
         }
+    }
+
+    /**
+     * @brief Reads back one exact female-Orc base-body draw without changing either GPU buffer.
+     *
+     * The probe is deliberately downstream of the model/skin rebuilds: GetStreamSource and
+     * GetIndices name the resources D3D will actually consume.  A READONLY lock is attempted over
+     * only this draw's byte windows.  Some WotLK buffers are declared WRITEONLY; in that case D3D9
+     * normally rejects READONLY and a flags=0 fallback would make CPU reads undefined, so it is
+     * explicitly not attempted.  The fallback is used only for a non-WRITEONLY descriptor.
+     */
+    void ProbeFemaleOrcD3DGeometry(void* rawDevice, int baseVertexIndex,
+                                   unsigned minVertexIndex, unsigned numVertices,
+                                   unsigned drawStartIndex, unsigned primitiveCount) noexcept
+    {
+        if (!rawDevice ||
+            InterlockedCompareExchange(&g_orcFemaleD3DProbeState, 2, 2) == 2)
+            return;
+
+        IDirect3DVertexBuffer9* vb = nullptr;
+        IDirect3DIndexBuffer9* ib = nullptr;
+        void* vbBytes = nullptr;
+        void* ibBytes = nullptr;
+        bool vbLocked = false;
+        bool ibLocked = false;
+        bool faulted = false;
+        void* shared = nullptr;
+        const wxl::structure::m2::M2SkinSection* section = nullptr;
+        const char* path = nullptr;
+
+        __try
+        {
+            auto* const dc = static_cast<const off::DrawBatchContext*>(g_curDrawCtx);
+            section = dc
+                ? static_cast<const wxl::structure::m2::M2SkinSection*>(dc->section) : nullptr;
+            shared = g_curModel
+                ? *reinterpret_cast<void**>(static_cast<uint8_t*>(g_curModel) + m2off::kOffInstModel)
+                : nullptr;
+            path = shared && wxl::modern::assets::m2::IsNativeLoaded(shared)
+                ? wxl::game::m2::M2Model(shared).GetPathStem() : nullptr;
+
+            const bool exactPath = path &&
+                (std::strcmp(path, "character\\orc\\female\\orcfemale_hd.m2") == 0 ||
+                 std::strcmp(path, "character\\orc\\female\\orcfemale_hd") == 0 ||
+                 std::strcmp(path, "character\\human\\male\\humanmale_hd.m2") == 0 ||
+                 std::strcmp(path, "character\\human\\male\\humanmale_hd") == 0);
+            if (!exactPath || !section || section->skinSectionId != 0)
+                return;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+
+        if (InterlockedCompareExchange(&g_orcFemaleD3DProbeState, 1, 0) != 0)
+            return;
+
+        __try
+        {
+            auto* const header = wxl::game::m2::M2Model(shared).GetHeader();
+            auto* const skin = wxl::game::m2::M2Model(shared).GetSkin();
+            auto* const device = static_cast<IDirect3DDevice9*>(rawDevice);
+            const auto* const modelVertices = header && header->vertices.offset
+                ? reinterpret_cast<const uint8_t*>(
+                    static_cast<uintptr_t>(header->vertices.offset)) : nullptr;
+
+            if (!header || !skin || !modelVertices || !header->vertices.count ||
+                !skin->vertexLookup || !skin->indices || !skin->indexCount)
+            {
+                WLOG_WARN("orc-female-d3d: source unavailable header=%p skin=%p modelVertices=%p"
+                          " lookup=%p skinBones=%p indices=%p modelVertexCount=%u"
+                          " skinVertexCount=%u indexCount=%u path='%s'",
+                          header, skin, modelVertices,
+                          skin ? skin->vertexLookup : nullptr,
+                          skin ? skin->bones : nullptr,
+                          skin ? skin->indices : nullptr,
+                          header ? header->vertices.count : 0,
+                          skin ? skin->vertexCount : 0,
+                          skin ? skin->indexCount : 0, path);
+            }
+            else
+            {
+                UINT streamOffset = 0;
+                UINT streamStride = 0;
+                D3DVERTEXBUFFER_DESC vbDesc{};
+                D3DINDEXBUFFER_DESC ibDesc{};
+                const HRESULT hrStream = device->GetStreamSource(
+                    0, &vb, &streamOffset, &streamStride);
+                const HRESULT hrIndices = device->GetIndices(&ib);
+                const HRESULT hrVbDesc = SUCCEEDED(hrStream) && vb
+                    ? vb->GetDesc(&vbDesc) : E_FAIL;
+                const HRESULT hrIbDesc = SUCCEEDED(hrIndices) && ib
+                    ? ib->GetDesc(&ibDesc) : E_FAIL;
+
+                const uint32_t sectionStart =
+                    (static_cast<uint32_t>(section->level) << 16) | section->indexStart;
+                const uint64_t primitiveIndices64 = static_cast<uint64_t>(primitiveCount) * 3u;
+                const uint32_t drawIndexCount = static_cast<uint32_t>(
+                    primitiveIndices64 < section->indexCount
+                        ? primitiveIndices64 : section->indexCount);
+
+                WLOG_INFO("orc-female-d3d: begin device=%p vb=%p ib=%p streamHr=%#lx"
+                          " indicesHr=%#lx offset=%u stride=%u sectionStart=%u drawStart=%u"
+                          " indexCount=%u/%u bv=%d min=%u vertices=%u path='%s'",
+                          device, vb, ib,
+                          static_cast<unsigned long>(hrStream),
+                          static_cast<unsigned long>(hrIndices),
+                          streamOffset, streamStride, sectionStart, drawStartIndex,
+                          drawIndexCount, static_cast<unsigned>(section->indexCount),
+                          baseVertexIndex, minVertexIndex, numVertices, path);
+
+                if (SUCCEEDED(hrVbDesc))
+                    WLOG_INFO("orc-female-d3d: VB desc size=%u usage=%#lx pool=%u"
+                              " format=%u type=%u fvf=%#lx source=%p lookup=%p bones=%p",
+                              vbDesc.Size, static_cast<unsigned long>(vbDesc.Usage),
+                              static_cast<unsigned>(vbDesc.Pool),
+                              static_cast<unsigned>(vbDesc.Format),
+                              static_cast<unsigned>(vbDesc.Type),
+                              static_cast<unsigned long>(vbDesc.FVF),
+                              modelVertices, skin->vertexLookup, skin->bones);
+                else
+                    WLOG_WARN("orc-female-d3d: VB descriptor unavailable hr=%#lx",
+                              static_cast<unsigned long>(hrVbDesc));
+
+                if (SUCCEEDED(hrIbDesc))
+                    WLOG_INFO("orc-female-d3d: IB desc size=%u usage=%#lx pool=%u"
+                              " format=%u type=%u source=%p",
+                              ibDesc.Size, static_cast<unsigned long>(ibDesc.Usage),
+                              static_cast<unsigned>(ibDesc.Pool),
+                              static_cast<unsigned>(ibDesc.Format),
+                              static_cast<unsigned>(ibDesc.Type), skin->indices);
+                else
+                    WLOG_WARN("orc-female-d3d: IB descriptor unavailable hr=%#lx",
+                              static_cast<unsigned long>(hrIbDesc));
+
+                // Read and compare the exact GPU index window against the section's canonical live
+                // skin window.  The GPU offset deliberately uses the DIP argument; the expected
+                // pointer deliberately uses the full section start so a truncation is observable.
+                HRESULT hrIbLock = E_FAIL;
+                DWORD ibLockFlags = D3DLOCK_READONLY;
+                uint32_t ibMismatch = 0;
+                uint32_t ibOutsideDraw = 0;
+                uint32_t ibSamples = 0;
+                const uint32_t ibElementSize = SUCCEEDED(hrIbDesc)
+                    ? (ibDesc.Format == D3DFMT_INDEX16 ? 2u
+                       : (ibDesc.Format == D3DFMT_INDEX32 ? 4u : 0u)) : 0u;
+                const uint64_t gpuIbEnd =
+                    (static_cast<uint64_t>(drawStartIndex) + drawIndexCount) * ibElementSize;
+                const bool ibSourceFits = sectionStart <= skin->indexCount &&
+                    drawIndexCount <= skin->indexCount - sectionStart;
+                const bool ibGpuFits = ibElementSize && gpuIbEnd <= ibDesc.Size;
+                const bool ibWriteOnly = SUCCEEDED(hrIbDesc) &&
+                    (ibDesc.Usage & D3DUSAGE_WRITEONLY) != 0;
+
+                if (ib && SUCCEEDED(hrIbDesc) && drawIndexCount && ibSourceFits && ibGpuFits)
+                {
+                    hrIbLock = ib->Lock(drawStartIndex * ibElementSize,
+                                        drawIndexCount * ibElementSize,
+                                        &ibBytes, D3DLOCK_READONLY);
+                    ibLocked = SUCCEEDED(hrIbLock);
+                    if (hrIbLock == D3DERR_INVALIDCALL && !ibWriteOnly)
+                    {
+                        ibLockFlags = 0;
+                        hrIbLock = ib->Lock(drawStartIndex * ibElementSize,
+                                            drawIndexCount * ibElementSize, &ibBytes, 0);
+                        ibLocked = SUCCEEDED(hrIbLock);
+                    }
+
+                    // Even an unexpectedly successful READONLY lock on a WRITEONLY resource does
+                    // not make reading it defined by D3D9; unlock it without touching the bytes.
+                    if (ibLocked && !ibWriteOnly)
+                    {
+                        for (uint32_t i = 0; i < drawIndexCount; ++i)
+                        {
+                            const uint32_t gpu = ibElementSize == 2
+                                ? static_cast<const uint16_t*>(ibBytes)[i]
+                                : static_cast<const uint32_t*>(ibBytes)[i];
+                            const uint32_t expected = skin->indices[sectionStart + i];
+                            const bool mismatch = gpu != expected;
+                            const uint64_t drawVertexEnd =
+                                static_cast<uint64_t>(minVertexIndex) + numVertices;
+                            const bool outside = gpu < minVertexIndex || gpu >= drawVertexEnd;
+                            if (mismatch) ++ibMismatch;
+                            if (outside) ++ibOutsideDraw;
+                            if ((mismatch || outside) && ibSamples < 4)
+                            {
+                                ++ibSamples;
+                                WLOG_INFO("orc-female-d3d: IB sample i=%u gpu=%u expected=%u"
+                                          " mismatch=%u outsideDraw=%u",
+                                          i, gpu, expected, mismatch ? 1u : 0u,
+                                          outside ? 1u : 0u);
+                            }
+                        }
+                    }
+                }
+
+                WLOG_INFO("orc-female-d3d: IB read hr=%#lx flags=%#lx writeOnly=%u"
+                          " sourceFits=%u gpuFits=%u formatBytes=%u startMatch=%u"
+                          " compared=%u mismatches=%u outsideDraw=%u%s",
+                          static_cast<unsigned long>(hrIbLock),
+                          static_cast<unsigned long>(ibLockFlags), ibWriteOnly ? 1u : 0u,
+                          ibSourceFits ? 1u : 0u, ibGpuFits ? 1u : 0u, ibElementSize,
+                          sectionStart == drawStartIndex ? 1u : 0u,
+                          ibLocked && !ibWriteOnly ? drawIndexCount : 0u,
+                          ibMismatch, ibOutsideDraw,
+                          ibWriteOnly ? " (flags=0 fallback skipped: CPU read is undefined)" : "");
+
+                // Stream zero contains one vertex per live skin lookup entry.  Compare the complete
+                // draw range's positions and all raw fields except the four register-slot bytes;
+                // those slots are checked separately against skin->bones because geometry splitting
+                // can legitimately give two live lookup entries for one source model vertex.
+                HRESULT hrVbLock = E_FAIL;
+                DWORD vbLockFlags = D3DLOCK_READONLY;
+                uint32_t vbCompared = 0;
+                uint32_t vbInvalidLookup = 0;
+                uint32_t vbPositionMismatch = 0;
+                uint32_t vbRecordSansBoneMismatch = 0;
+                uint32_t vbRawRecordMismatch = 0;
+                uint32_t vbSlotMismatch = 0;
+                uint32_t vbSamples = 0;
+                const int64_t physicalVertexStart =
+                    static_cast<int64_t>(baseVertexIndex) + minVertexIndex;
+                const uint64_t logicalVertexEnd =
+                    static_cast<uint64_t>(minVertexIndex) + numVertices;
+                const uint64_t vbByteOffset64 = physicalVertexStart >= 0
+                    ? static_cast<uint64_t>(streamOffset) +
+                        static_cast<uint64_t>(physicalVertexStart) * streamStride : ~uint64_t(0);
+                const uint64_t vbByteSize64 = static_cast<uint64_t>(numVertices) * streamStride;
+                const bool vbSourceFits = logicalVertexEnd <= skin->vertexCount;
+                const bool vbGpuFits = SUCCEEDED(hrVbDesc) && physicalVertexStart >= 0 &&
+                    streamStride >= 12 && numVertices <= 0x10000u &&
+                    vbByteOffset64 <= vbDesc.Size && vbByteSize64 <= vbDesc.Size - vbByteOffset64;
+                const bool vbWriteOnly = SUCCEEDED(hrVbDesc) &&
+                    (vbDesc.Usage & D3DUSAGE_WRITEONLY) != 0;
+
+                if (vb && SUCCEEDED(hrVbDesc) && numVertices && vbSourceFits && vbGpuFits)
+                {
+                    hrVbLock = vb->Lock(static_cast<UINT>(vbByteOffset64),
+                                        static_cast<UINT>(vbByteSize64),
+                                        &vbBytes, D3DLOCK_READONLY);
+                    vbLocked = SUCCEEDED(hrVbLock);
+                    if (hrVbLock == D3DERR_INVALIDCALL && !vbWriteOnly)
+                    {
+                        vbLockFlags = 0;
+                        hrVbLock = vb->Lock(static_cast<UINT>(vbByteOffset64),
+                                            static_cast<UINT>(vbByteSize64), &vbBytes, 0);
+                        vbLocked = SUCCEEDED(hrVbLock);
+                    }
+
+                    if (vbLocked && !vbWriteOnly)
+                    {
+                        for (uint32_t i = 0; i < numVertices; ++i)
+                        {
+                            const uint32_t logical = minVertexIndex + i;
+                            const uint32_t source = skin->vertexLookup[logical];
+                            const auto* const gpu = static_cast<const uint8_t*>(vbBytes) +
+                                static_cast<size_t>(i) * streamStride;
+                            if (source >= header->vertices.count)
+                            {
+                                ++vbInvalidLookup;
+                                continue;
+                            }
+
+                            const auto* const expected = modelVertices +
+                                static_cast<size_t>(source) * 0x30u;
+                            const bool posMismatch = std::memcmp(gpu, expected, 12) != 0;
+                            bool sansBoneMismatch = false;
+                            bool rawMismatch = false;
+                            bool slotMismatch = false;
+                            if (streamStride >= 0x30u)
+                            {
+                                rawMismatch = std::memcmp(gpu, expected, 0x30u) != 0;
+                                sansBoneMismatch = std::memcmp(gpu, expected, 0x10u) != 0 ||
+                                    std::memcmp(gpu + 0x14u, expected + 0x14u, 0x1Cu) != 0;
+                                slotMismatch = skin->bones &&
+                                    std::memcmp(gpu + 0x10u,
+                                                skin->bones + static_cast<size_t>(logical) * 4u,
+                                                4u) != 0;
+                            }
+
+                            ++vbCompared;
+                            if (posMismatch) ++vbPositionMismatch;
+                            if (sansBoneMismatch) ++vbRecordSansBoneMismatch;
+                            if (rawMismatch) ++vbRawRecordMismatch;
+                            if (slotMismatch) ++vbSlotMismatch;
+                            if ((posMismatch || sansBoneMismatch || slotMismatch) && vbSamples < 4)
+                            {
+                                ++vbSamples;
+                                float gpuPos[3]{};
+                                float expectedPos[3]{};
+                                std::memcpy(gpuPos, gpu, sizeof(gpuPos));
+                                std::memcpy(expectedPos, expected, sizeof(expectedPos));
+                                const uint8_t* const liveSlots = skin->bones
+                                    ? skin->bones + static_cast<size_t>(logical) * 4u : nullptr;
+                                WLOG_INFO("orc-female-d3d: VB sample logical=%u physical=%lld"
+                                          " source=%u gpuPos=%.6g,%.6g,%.6g"
+                                          " expectedPos=%.6g,%.6g,%.6g"
+                                          " gpuSlots=%u,%u,%u,%u liveSlots=%u,%u,%u,%u"
+                                          " posMismatch=%u sansBoneMismatch=%u slotMismatch=%u",
+                                          logical, static_cast<long long>(physicalVertexStart + i),
+                                          source, gpuPos[0], gpuPos[1], gpuPos[2],
+                                          expectedPos[0], expectedPos[1], expectedPos[2],
+                                          streamStride >= 0x14u ? gpu[0x10] : 0,
+                                          streamStride >= 0x14u ? gpu[0x11] : 0,
+                                          streamStride >= 0x14u ? gpu[0x12] : 0,
+                                          streamStride >= 0x14u ? gpu[0x13] : 0,
+                                          liveSlots ? liveSlots[0] : 0,
+                                          liveSlots ? liveSlots[1] : 0,
+                                          liveSlots ? liveSlots[2] : 0,
+                                          liveSlots ? liveSlots[3] : 0,
+                                          posMismatch ? 1u : 0u,
+                                          sansBoneMismatch ? 1u : 0u,
+                                          slotMismatch ? 1u : 0u);
+                            }
+                        }
+                    }
+                }
+
+                WLOG_INFO("orc-female-d3d: VB read hr=%#lx flags=%#lx writeOnly=%u"
+                          " sourceFits=%u gpuFits=%u compared=%u invalidLookup=%u"
+                          " positionMismatch=%u sansBoneMismatch=%u rawMismatch=%u"
+                          " slotMismatch=%u%s",
+                          static_cast<unsigned long>(hrVbLock),
+                          static_cast<unsigned long>(vbLockFlags), vbWriteOnly ? 1u : 0u,
+                          vbSourceFits ? 1u : 0u, vbGpuFits ? 1u : 0u,
+                          vbCompared, vbInvalidLookup, vbPositionMismatch,
+                          vbRecordSansBoneMismatch, vbRawRecordMismatch, vbSlotMismatch,
+                          vbWriteOnly ? " (flags=0 fallback skipped: CPU read is undefined)" : "");
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            faulted = true;
+        }
+
+        // Do not rely on C++ unwinding across SEH.  Every COM/lock cleanup gets its own guard so an
+        // unusual driver failure cannot strand the once-state or turn a diagnostic into a crash.
+        if (ibLocked && ib)
+            __try { ib->Unlock(); } __except (EXCEPTION_EXECUTE_HANDLER) { faulted = true; }
+        if (vbLocked && vb)
+            __try { vb->Unlock(); } __except (EXCEPTION_EXECUTE_HANDLER) { faulted = true; }
+        if (ib)
+            __try { ib->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { faulted = true; }
+        if (vb)
+            __try { vb->Release(); } __except (EXCEPTION_EXECUTE_HANDLER) { faulted = true; }
+
+        if (faulted)
+            WLOG_WARN("orc-female-d3d: guarded probe/cleanup fault; draw left unmodified");
+        InterlockedExchange(&g_orcFemaleD3DProbeState, 2);
     }
 
     /**
@@ -207,6 +735,8 @@ namespace
      */
     int __fastcall hkRibbonDraw(void* self, void* edx, void* stateBlock)
     {
+        void* previousTraceRibbon=traceRibbon;traceRibbon=self;
+        void* previousRibbonEmitter=wxl::modern::ribbon::SetEmitter(self);
         g_ribbonModern = false;
 
         uint8_t*  emitter       = static_cast<uint8_t*>(self);
@@ -214,7 +744,7 @@ namespace
         uint32_t  savedLayers   = 0;
         uint32_t* layerCountPtr = nullptr;
 
-        if (emitter)
+        if (emitter && !wxl::modern::ribbon::Owns(emitter))
         {
             __try
             {
@@ -245,6 +775,8 @@ namespace
         if (bridged && layerCountPtr)
             __try { *layerCountPtr = savedLayers; } __except (EXCEPTION_EXECUTE_HANDLER) {}
         g_ribbonModern = false;
+        traceRibbon=previousTraceRibbon;
+        wxl::modern::ribbon::SetEmitter(previousRibbonEmitter);
         return r;
     }
 
@@ -259,6 +791,11 @@ namespace
      */
     long __stdcall hkDIP(void* dev, int pt, int bv, unsigned mi, unsigned nv, unsigned si, unsigned pc)
     {
+        si = wxl::runtime::m2shadow::PrepareDIP(dev,pt,si,pc);
+        wxl::runtime::m2shadow::BeforeDIP(dev, si, pc);
+        TraceDraw(dev,_ReturnAddress(),1,pt,nv,pc,1);
+        if(traceCapture&&traceEngineRow!=UINT_MAX)++traceRows[traceEngineRow].dips;
+        wxl::modern::particlelayers::ObserveDIP(g_oneShot!=nullptr,g_ribbonModern);
         if (WXL_M2Draw_InterceptFn intercept = g_oneShot)
         {
             g_oneShot = nullptr;
@@ -267,8 +804,52 @@ namespace
         if (g_ribbonModern)
             return DrawRibbonMultiTexture(static_cast<IDirect3DDevice9*>(dev), pt, bv, mi, nv, si, pc);
 
-        const unsigned drawStartIndex = ExpandM2StartIndex(si);
-        long r = g_origDIP(dev, pt, bv, mi, nv, drawStartIndex, pc);
+        if(wxl::modern::ribbon::Active())
+            return wxl::modern::ribbon::Draw(dev,pt,bv,mi,nv,si,pc,g_origDIP);
+
+        wxl::modern::particlediag::BeforeDIP(dev, si, pc);
+        if (wxl::modern::particlelayers::Active())
+            return wxl::modern::particlelayers::DrawDIP(dev, pt, bv, mi, nv, si, pc, g_origDIP);
+        const unsigned drawStartIndex = wxl::runtime::m2shadow::HasShadowContext()
+            ? si : ExpandM2StartIndex(si);
+        ProbeFemaleOrcD3DGeometry(dev, bv, mi, nv, drawStartIndex, pc);
+        wxl::modern::materialdiag::BeforeDraw(dev, g_curDrawCtx, g_curModel, drawStartIndex, pc);
+        long r = wxl::modern::materialblend::Draw(dev, g_curDrawCtx, g_curModel,
+            pt, bv, mi, nv, drawStartIndex, pc, g_origDIP);
+
+        // One bounded proof that the Retail Orc-female base model reaches D3D after visibility,
+        // optimized-list construction, material setup and bone-palette upload. g_curModel is the
+        // instance stored by the draw context; its +0x2C field is the shared model carrying the path.
+        __try
+        {
+            void* const shared = g_curModel
+                ? *reinterpret_cast<void**>(static_cast<uint8_t*>(g_curModel) + m2off::kOffInstModel)
+                : nullptr;
+            const char* const path = shared && wxl::modern::assets::m2::IsNativeLoaded(shared)
+                ? wxl::game::m2::M2Model(shared).GetPathStem() : nullptr;
+            if (path && std::strcmp(path, "character\\orc\\female\\orcfemale_hd.m2") == 0)
+            {
+                static uint32_t drawReports = 0;
+                if (drawReports < 32)
+                {
+                    ++drawReports;
+                    const auto* const dc = static_cast<const off::DrawBatchContext*>(g_curDrawCtx);
+                    const auto* const section = dc
+                        ? static_cast<const wxl::structure::m2::M2SkinSection*>(dc->section) : nullptr;
+                    const float alpha = dc && dc->element
+                        ? *reinterpret_cast<const float*>(
+                            static_cast<const uint8_t*>(dc->element) + m2off::kOffElementAlpha)
+                        : -1.0f;
+                    WLOG_INFO("char-draw: Orc female section=%u level=%u alpha=%.6f"
+                              " bv=%d min=%u verts=%u start=%u prims=%u hr=%#lx",
+                              section ? static_cast<unsigned>(section->skinSectionId) : 0xFFFFFFFFu,
+                              section ? static_cast<unsigned>(section->level) : 0xFFFFFFFFu,
+                              alpha, bv, mi, nv, drawStartIndex, pc, r);
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
         if (g_curModel && !g_inM2Emit)
         {
             g_inM2Emit = true;
@@ -290,13 +871,14 @@ namespace
 
     /**
      * @brief Installs the DIP swap on the live device. Each device instance may carry its own vtable, so
-     *        on a device recreate the swap is gone; this re-applies it on the current device. Guarded
-     *        against a shared vtable: if it already carries our hook, re-swapping would capture our own
-     *        hook as the "original" and recurse, so only the device pointer is updated.
+     *        on a device recreate the swap is gone; this re-applies it on the current device. D3D9 can
+     *        also restore the original vtable in-place during Reset, so the slot is authoritative; the
+     *        device pointer alone is not proof that the hook survived. Comparing the slot still protects
+     *        shared vtables from capturing hkDIP as its own original.
      */
     void EnsureDIPHook(IDirect3DDevice9* dev)
     {
-        if (!dev || g_hookedDevice == dev) return;
+        if (!dev) return;
         void** vtbl = *reinterpret_cast<void***>(dev);
         if (vtbl[off::vt::kDrawIndexedPrimitive] != reinterpret_cast<void*>(&hkDIP))
         {
@@ -304,7 +886,6 @@ namespace
                                   reinterpret_cast<void**>(&g_origDIP));
             WLOG_INFO("m2-draw: DrawIndexedPrimitive hook installed (dev=%p)", static_cast<void*>(dev));
         }
-        g_hookedDevice = dev;
     }
 
     /// Re-applies the DIP swap on the same per-frame cadence core's own Render.cpp uses for its three
@@ -316,25 +897,46 @@ namespace
         if (a && a->device)
             EnsureDIPHook(static_cast<IDirect3DDevice9*>(a->device));
     }
+
+    /// Rendering can stop before OnWorldRenderEnd when D3D loses its context. The core's OnUpdate
+    /// cadence remains alive and reconciles its own slots there; do the same for DIP so an in-place
+    /// vtable restore cannot permanently drop modern M2 draw handling after recovery.
+    void __cdecl OnUpdate(void* /*user*/, const void* /*argsRaw*/)
+    {
+        if (void* dev = gx::RawDevice())
+            EnsureDIPHook(static_cast<IDirect3DDevice9*>(dev));
+    }
 }
 
 namespace wxl_modern_m2
 {
     bool InstallM2Draw()
     {
+        wxl::modern::shaderobjects::Initialize();
+        wxl::modern::materialdiag::Initialize();
+        wxl::modern::materialblend::Initialize();
+        wxl::modern::particlediag::Initialize();
+        wxl::modern::ribbon::Initialize();
+        if(pl::TraceEnabled()) {
+            g_api->Subscribe(uint32_t(ev::Event::OnFrame),&TraceFrame,nullptr);
+            g_api->Subscribe(uint32_t(ev::Event::OnDeviceLost),&TraceLost,nullptr);
+            WLOG_WARN("m2-draw-trace: enabled; read-only eight Present intervals after target activity, 2048 rows per interval; kind 0=engine preflush, 1=DIP preoverride");
+        }
         if (void* dev = gx::RawDevice())
             EnsureDIPHook(static_cast<IDirect3DDevice9*>(dev));
         else
             WLOG_WARN("m2-draw: device not up, DIP hook deferred to first world-render-end");
 
         g_api->Subscribe(uint32_t(ev::Event::OnWorldRenderEnd), &OnWorldRenderEnd, nullptr);
+        g_api->Subscribe(uint32_t(ev::Event::OnUpdate), &OnUpdate, nullptr);
 
         HookAttachByName("M2.DrawBatch", &hkDrawBatch, &g_origDrawBatch);
         HookAttachByName("M2.RibbonDraw", &hkRibbonDraw, &g_origRibbonDraw);
+        HookAttachByName("Gx.DeviceDraw", &hkDeviceDraw, &g_origDeviceDraw);
 
         g_api->PublishInterface("wxl.m2draw", WXL_M2DRAW_API_VERSION, &g_m2DrawApi);
 
-        WLOG_INFO("m2-draw: batch/ribbon detours installed, wxl.m2draw published");
+        WLOG_INFO("m2-draw: batch/ribbon/device-draw detours installed, wxl.m2draw published");
         return true;
     }
 }

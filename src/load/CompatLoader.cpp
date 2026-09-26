@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "../ExtensionApi.hpp"
+#include "../compat/BoneBudget.hpp"
 #include "NativeLoad.hpp"
 
 #include "engine/events/Event.hpp"
@@ -32,6 +33,7 @@ namespace
 {
     namespace ev = wxl::events;
     namespace m2 = wxl::offsets::game::m2;
+    namespace bn = wxl::modern::assets::common::bones;
 
     m2::M2_InitFn               g_origM2Init             = nullptr;
     m2::M2_FinalizeSkinFn       g_origFinalizeSkin       = nullptr;
@@ -49,17 +51,24 @@ namespace
      */
     int __fastcall hkM2Init(void* model)
     {
+        const uint32_t started = GetTickCount();
         ev::ModelLoadArgs pre{ model };
         wxl_modern_m2::g_api->Emit(uint32_t(ev::Event::OnModelLoadPre), &pre);
 
+        const uint32_t prepared = GetTickCount();
         int r;
         if (wxl_modern_m2::kEnabled && wxl::runtime::m2native::IsModernContainer(model))
             r = wxl::runtime::m2native::NativeLoad(model);
         else
             r = g_origM2Init(model);
 
+        const uint32_t parsed = GetTickCount();
         ev::ModelLoadArgs a{ model };
         wxl_modern_m2::g_api->Emit(uint32_t(ev::Event::OnModelLoad), &a);
+        const uint32_t finished = GetTickCount();
+        if (finished - started >= 20)
+            WLOG_INFO("race-switch-model-timing: model=%p pre_ms=%u parse_ms=%u post_ms=%u total_ms=%u",
+                model, prepared-started, parsed-prepared, finished-parsed, finished-started);
         return r;
     }
 
@@ -97,6 +106,11 @@ namespace
         ev::M2SkinFinalizeArgs a{ model };
         wxl_modern_m2::g_api->Emit(uint32_t(ev::Event::OnM2SkinFinalize), &a);
         g_origFinalizeSkin(model);
+
+        // The native finalize consumes the slot-numbered table while building the GPU vertices,
+        // then flattens that same table and each section window. Restore the model-bone map only
+        // after the vertex slots have been captured and before the first palette upload.
+        bn::RestorePaletteMap(model);
 
         // Native finalize stores one optional shader-effect pointer per skin batch at model+0x188.
         // Diagnose and clear values that are already invalid here; the sorter guard (HitTestSort.cpp)

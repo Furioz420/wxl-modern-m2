@@ -20,6 +20,7 @@
 
 #include "../ExtensionApi.hpp"
 #include "M2NativeInternal.hpp"
+#include "../compat/RiftTextureBundle.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -47,6 +48,73 @@ namespace wxl::runtime::m2native::detail
             if (newId < lookupCount && lookup[newId] == oldPos) { lookup[newId] = newPos; return; }
             for (uint32_t i = 0; i < lookupCount; ++i)
                 if (lookup[i] == oldPos) { lookup[i] = newPos; break; }
+        }
+
+        int16_t EmbeddedFallback(const fmt::M2Sequence* seqs, uint32_t count, uint32_t source)
+        {
+            if (!seqs || source >= count) return -1;
+
+            // Prefer another variation of the same animation. Retail commonly keeps an embedded
+            // baseline variation next to streamed high-detail variations.
+            const uint16_t id = seqs[source].id;
+            for (uint32_t i = 0; i < count; ++i)
+                if (i != source && seqs[i].id == id && (seqs[i].flags & 0x20u))
+                    return static_cast<int16_t>(i);
+
+            // Stand is the safest cross-model bind-pose fallback. If this model has no embedded
+            // stand sequence, use its first embedded sequence rather than exposing a relative
+            // external-track pointer to the live evaluator.
+            for (uint32_t i = 0; i < count; ++i)
+                if (seqs[i].id == 0 && (seqs[i].flags & 0x20u))
+                    return static_cast<int16_t>(i);
+            for (uint32_t i = 0; i < count; ++i)
+                if (seqs[i].flags & 0x20u)
+                    return static_cast<int16_t>(i);
+            return -1;
+        }
+
+        void ParkExternalSequenceLookups(fmt::M2Sequence* seqs, uint32_t sequenceCount,
+                                         int16_t* lookup, uint32_t lookupCount)
+        {
+            if (!seqs || !sequenceCount) return;
+
+            // The native reader does not yet own Phase-2 streamed sequence scheduling. Until it
+            // does, never let SetSequence select an index whose nested track pointers deliberately
+            // remain file-relative. This implements the bind-pose promise made by NativeLoad.
+            if (lookup)
+            {
+                for (uint32_t i = 0; i < lookupCount; ++i)
+                {
+                    const int16_t index = lookup[i];
+                    if (index < 0 || static_cast<uint32_t>(index) >= sequenceCount ||
+                        (seqs[index].flags & 0x20u))
+                        continue;
+                    lookup[i] = EmbeddedFallback(seqs, sequenceCount, static_cast<uint32_t>(index));
+                }
+            }
+
+            // Variation/alias walks can bypass sequenceLookup after the first choice. Close those
+            // paths as well, retaining an embedded sibling where one exists.
+            for (uint32_t i = 0; i < sequenceCount; ++i)
+            {
+                auto parkTarget = [&](int32_t target) -> int16_t {
+                    if (target < 0 || static_cast<uint32_t>(target) >= sequenceCount)
+                        return -1;
+                    if (seqs[target].flags & 0x20u)
+                        return static_cast<int16_t>(target);
+                    return EmbeddedFallback(seqs, sequenceCount, static_cast<uint32_t>(target));
+                };
+
+                if (seqs[i].variationNext >= 0)
+                    seqs[i].variationNext = parkTarget(seqs[i].variationNext);
+                if (seqs[i].aliasNext < sequenceCount &&
+                    !(seqs[seqs[i].aliasNext].flags & 0x20u))
+                {
+                    const int16_t fallback = parkTarget(seqs[i].aliasNext);
+                    seqs[i].aliasNext = fallback >= 0 ? static_cast<uint16_t>(fallback)
+                                                       : static_cast<uint16_t>(i);
+                }
+            }
         }
     }
 
@@ -104,6 +172,9 @@ namespace wxl::runtime::m2native::detail
             seqs[i].blendTime &= 0xFFFFu;
             if (!(seqs[i].flags & 0x20u)) ++extSeqPending;
         }
+
+        if (extSeqPending)
+            ParkExternalSequenceLookups(seqs, h->sequences.count, lookup, lookupCount);
     }
 
     /**
@@ -133,17 +204,37 @@ namespace wxl::runtime::m2native::detail
      *        step then creates a texture for exactly that path; an unresolved id keeps count 0 and falls
      *        back to the stock solid-white placeholder.
      */
-    void InjectTxidNames(fmt::M2Header* h, const Scan& s, Outcome& out)
+    void InjectTxidNames(fmt::M2Header* h, const Scan& s, Outcome& out, const char* modelPath)
     {
+        // Maria's hair and dress share one fixed atlas. Promote that exact texture into a private
+        // replaceable slot so character creation can bind a per-instance colour variant without
+        // cloning the model or mutating the process-wide fixed-texture resource.
+        constexpr uint32_t kMurlocMariaAtlasFileDataId = 1502339u;
+        constexpr uint32_t kMurlocMariaAtlasTextureType = 31u;
         if (!h->textures.count || !h->textures.offset) return;
         auto* tex = reinterpret_cast<fmt::M2Texture*>(static_cast<uintptr_t>(h->textures.offset));
+        namespace bundle=wxl::modern::assets::m2::rifttextures;
+        const bool useBundle=out.rollbackBuffer&&s.txidCount<=kMaxTxid&&bundle::Matches(
+            wxl_modern_m2::ConfigBool("WXL_M2_RIFT_TEXTURE_BUNDLE",false),modelPath?modelPath:"",
+            {out.rollbackBuffer,out.rawSize},{s.txid,s.txidCount},h->textures.count)&&
+            bundle::CanBind({tex,h->textures.count});
+        if(useBundle)WLOG_INFO("m2-rift-textures: selected donorBuild=61621 textures=27 privateRoot='spells\\wxl_rift_61621' sourceVerified=1; readiness is verified by subsequent texture reads/draws");
         for (uint32_t i = 0; i < h->textures.count; ++i)
         {
+            const uint32_t fdid = i < s.txidCount ? s.txid[i] : 0;
+            if (fdid == kMurlocMariaAtlasFileDataId)
+            {
+                tex[i].type = kMurlocMariaAtlasTextureType;
+                tex[i].filename.count = 0;
+                tex[i].filename.offset = 0;
+                WLOG_INFO("m2native: Maria fixed atlas TXID %u promoted to texture type %u",
+                          fdid, kMurlocMariaAtlasTextureType);
+                continue;
+            }
             if (tex[i].type != fmt::kTexTypeHardcoded) continue;   // dynamic slots stay empty
             if (tex[i].filename.count >= 2 && tex[i].filename.offset) continue; // inline name kept
-            const uint32_t fdid = i < s.txidCount ? s.txid[i] : 0;
             if (!fdid) continue;
-            const char* path = wxl_modern_m2::ResolveTexture(fdid);
+            const char* path = useBundle ? bundle::kEntries[i].path : wxl_modern_m2::ResolveTexture(fdid);
             if (!path)
             {
                 ++out.texUnresolved;

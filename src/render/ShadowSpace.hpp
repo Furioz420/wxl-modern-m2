@@ -41,6 +41,30 @@
  */
 namespace wxl::runtime::m2shadow
 {
+    // Default-off, read-only diagnostic context. Only the first actual DIP in a native run
+    // is sampled, so its first palette belongs to runs[drawIndex].instance, even when the
+    // native function internally loops over several capacity-limited groups.
+    struct TraceContext
+    {
+        void* instance; void* section; void* drawList;
+        uint32_t drawIndex; bool sawDraw;
+    };
+    class TraceScope
+    {
+        TraceContext context_;
+        TraceContext* previous_;
+    public:
+        TraceScope(void* instance, void* section, void* drawList, uint32_t drawIndex) noexcept;
+        ~TraceScope();
+        TraceScope(const TraceScope&) = delete;
+        TraceScope& operator=(const TraceScope&) = delete;
+    };
+    void BeforeDIP(void* device, unsigned startIndex, unsigned primitiveCount) noexcept;
+    // Shadow draws do not use the normal M2 draw context. Recover their modern index window
+    // only from the scoped native shadow section, with live skin and D3D buffer bounds checks.
+    unsigned PrepareDIP(void* device, int primitiveType, unsigned startIndex, unsigned primitiveCount) noexcept;
+    bool HasShadowContext() noexcept;
+
     struct Stats
     {
         uint32_t shadowDraws;      ///< shadow-map batch draws seen (0 => the hook never fires)

@@ -18,6 +18,7 @@
 #include "CombinerPatch.hpp"
 
 #include "engine/events/Event.hpp"
+#include "game/M2.hpp"
 
 #include "offsets/game/M2.hpp"
 

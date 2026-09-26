@@ -26,7 +26,8 @@ what's intentionally out of scope for now, and the safety/interface contract).
   pass down a path that never refreshes the pose.
 - **Effect and hit-test fixes**: particle/ribbon blending and triangle hit-testing corrected so effects
   render as intended and clicking selects the right thing.
-- **Crash-safe**: malformed input is a logged failure, never a crash.
+- **Extended sequence resolution**: modern animation IDs above the Wrath AnimationData ceiling resolve against the loaded M2, while an optional movement extension can own the final result through the versioned `wxl.m2-animation` interface.
+- **Input validation**: unsupported or malformed input is rejected in the validated loader paths. Runtime smoke testing is still required.
 
 ## Requirements
 
@@ -35,11 +36,18 @@ guessing, and says so in the log.
 
 ## Building
 
-This extension builds against [wxl-core](https://github.com/WarcraftXL/wxl-core) (branch `v1.1`), which
-auto-discovers any folder dropped into its `extensions/` directory, so there's no project file of its own
-needed here. See `.github/workflows/release.yml` for the exact steps; every push to `main` builds
-`wxl-modern-m2.dll` and publishes it as a release.
+This source snapshot follows WXL integration commit `db5f1b5`. Build it with the matching core/API revision, Modern BLP support, and intended M2/DB2 data; the moving upstream `v1.1` branch is not an exact compatibility pin. The imported `.github/workflows/release.yml` publishes from `main`, so keep this PR in draft until its core pin, Hub package contents, and runtime route are validated.
 
 ## License
 
 GPL-3.0-or-later. See the license header in every source file.
+
+## Integration and release checks
+
+Build `wxl-modern-m2` as a Win32 Release target against the exact core and shared M2/BLP source APIs used by this snapshot. The current workflow stages only the DLL; `wxl-modern-m2.cfg`, modern M2/skin/skeleton files, textures, and compatible DB2 catalogs are separate reviewed inputs. The modern loader can be evaluated without replacing the original Wrath model files; retail equipment and spell presentation additionally need matching data and provider services.
+
+Test one original Wrath model and one optional HD model, then inspect body textures, helmet/hair geosets, draw/sheath, shadows, and particle/ribbon effects. Run a Dalaran/Stormwind return route and inspect crash/memory logs. Keep a full DLL/config/asset rollback. The shared integration target compiles, but this large source snapshot still needs staged review, a pinned standalone build, runtime acceptance, and reconciliation with the existing WarcraftXL Modern M2 PR before release. `main` currently auto-publishes against moving upstream `v1.1`.
+
+## Credits
+
+The WXL core ABI and original module interfaces come from WarcraftXL contributors. The local v1.1 integration commits in this snapshot are attributed to Furioz in the integration history. Preserve source-file notices and the GPL-3.0-or-later `LICENSE` when redistributing source or binaries.

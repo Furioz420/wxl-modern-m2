@@ -132,6 +132,14 @@ namespace wxl::runtime::m2combiner
         return it != g_tagged.end() && it->second.count(batchIndex) != 0;
     }
 
+    void UnmarkAddAlphaBatch(void* skin, uint32_t batchIndex)
+    {
+        auto it=g_tagged.find(skin);
+        if(it==g_tagged.end())return;
+        it->second.erase(batchIndex);
+        if(it->second.empty())g_tagged.erase(it);
+    }
+
     void ArmNextBind() { g_pendingBind = true; }
 }
 
@@ -139,9 +147,8 @@ namespace wxl_modern_m2
 {
     bool InstallCombinerPatch()
     {
-        g_enabled = ConfigU32("WXL_M2_COMBINER_PATCH_ENABLED", 1, 0, 1) != 0;
         HookAttachByName("Shader.EffectBind", &hkEffectBind, &g_origEffectBind);
-        WLOG_INFO("m2-combiner: installed (enabled=%d)", g_enabled ? 1 : 0);
+        WLOG_INFO("m2-combiner: installed");
         return true;
     }
 }

@@ -45,6 +45,9 @@ namespace wxl::modern::assets::common::bones
 {
     // The client per-draw bone budget. A submesh past it is split (or, when a split is skipped, clamped).
     constexpr uint16_t kMaxBonesPerDraw = 75;
+    // Called only for validated modern native bodies, before offset relocation/initialization.
+    bool CaptureVertexOrigin(const wxl::structure::m2::M2Header* header,
+                             const uint8_t* body, uint32_t size) noexcept;
     // A submesh / batch count past this is treated as malformed; the commit is capped well under any value
     // that would overflow the native sizing.
     constexpr uint32_t kMaxBatches = 0x4000;
@@ -99,4 +102,33 @@ namespace wxl::modern::assets::common::bones
      * @param splitMap  Per-original-submesh sub-section run, as produced by SplitSubmeshes.
      */
     void RepointBatchesAfterSplit(wxl::game::m2::M2SkinProfile* skin, const std::vector<SplitRun>& splitMap);
+
+    /**
+     * @brief Republishes the palette window every section owns, after the native finalize has
+     *        overwritten it.
+     *
+     * Two consumers read header.boneCombos at two different moments and want two different answers
+     * from it. The vertex-buffer fill reads it first and stores what it finds as the vertex's bone
+     * index, which the shader uses as a REGISTER SLOT; that has to be the position within the
+     * section's window. The palette upload reads it afterwards to decide which model bone belongs in
+     * each slot; that has to be the bone itself.
+     *
+     * Between the two, the finalize does two things that only ever mattered to a model whose bones
+     * are already numbered densely from zero: it flattens the whole table to the identity, and it
+     * zeroes every section's window start, in the live section table AND in its own copy. So the
+     * rebuild commits the slot-numbered table, the finalize consumes it and wipes both halves, and
+     * this puts them back in time for the first upload.
+     *
+     * Calling it before the native finalize would defeat the vertex numbering; not calling it leaves
+     * every draw uploading whichever bones happen to sit at the front of the table.
+     * @param model Runtime model pointer, as handed to the finalize.
+     * @return true when a map was stored for this model's header and has been republished.
+     */
+    bool RestorePaletteMap(void* model);
+
+    /**
+     * @brief Drops the stored palette map for a header whose model is being reused or torn down.
+     * @param md Parsed model header.
+     */
+    void ForgetPaletteMap(const wxl::structure::m2::M2Header* md);
 }
