@@ -38,6 +38,10 @@
 #include "engine/events/Event.hpp"
 #include "engine/assets/shared/models/m2/M2Format.hpp"
 #include "../compat/ModernM2.hpp"
+#include "../compat/SourceMaterialCapture.hpp"
+#include "../compat/BoneBudget.hpp"
+#include "../render/RibbonShader.hpp"
+#include "../client/CharModel/RetailSkinProvider.hpp"
 #include "engine/assets/shared/models/m2/Contract.hpp"
 #include "game/Binding.hpp"
 #include "game/M2.hpp"
@@ -46,6 +50,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -71,6 +76,8 @@ namespace
     std::atomic<uint32_t> g_statSkipOther{ 0 };
     std::atomic<uint32_t> g_statExtSeqPending{ 0 };
     std::atomic<uint32_t> g_statShadowGateForced{ 0 };
+    std::atomic<uint32_t> g_statSkelSpliced{ 0 };
+    std::atomic<uint32_t> g_statSkelParented{ 0 };
 
     /**
      * @brief The full native load: demux, in-place deltas, stock walk, TXID injection, the stock
@@ -80,6 +87,7 @@ namespace
      */
     void NativeLoadCore(void* model, Outcome& out)
     {
+        out.phase = 1; // entry / raw model state
         auto* mdl = static_cast<off::M2Model*>(model);
         if (mdl->flags & 1u)
         {
@@ -93,10 +101,21 @@ namespace
         auto* buf = static_cast<uint8_t*>(mdl->header);
         const uint32_t size = mdl->fileSize;
         if (!buf || size < 8) { out.fail = "no buffer"; return; }
+        out.rawBuffer = buf;
+        out.rawSize = size;
+        out.rollbackBuffer = static_cast<uint8_t*>(std::malloc(size));
+        if (!out.rollbackBuffer) { out.fail = "no rollback buffer"; return; }
+        std::memcpy(out.rollbackBuffer, buf, size);
 
+        out.phase = 2; // container scan and body relocation
         Scan s;
         if (!ScanContainer(buf, size, s)) { out.fail = "no MD20 body in container"; return; }
         out.skipMask = s.skipMask;
+
+        if (s.sfidCount)
+            if (const char* path = wxl::game::m2::M2Model(model).GetPathStem())
+                wxl::client::charmodel::RegisterRetailSkinCompanion(
+                    path, s.sfidFirst);
 
         auto* h = reinterpret_cast<fmt::M2Header*>(buf + s.bodyOff);
         if (h->magic != fmt::kMagicMD20) { out.fail = "body magic"; return; }
@@ -108,14 +127,8 @@ namespace
             return;
         }
 
-        // A split-skeleton model (SKID / empty bone+sequence arrays) has no Phase-1 home: without the
-        // .skel splice it would stand unboned. Refuse the load (a clean miss, like an absent file) rather
-        // than filling a broken runtime. Phase 3 lifts this.
-        if ((s.skipMask & kSkipSkid) || (!h->bones.count && !h->sequences.count))
-        {
-            out.fail = "split skeleton (.skel) model -- Phase 3";
-            return;
-        }
+        out.needsSkel = ((s.skipMask & kSkipSkid) ||
+                         (!h->bones.count && !h->sequences.count)) ? 1u : 0u;
 
         // Slide the body onto the allocation base (chunk-header bytes ahead of it are dead after the
         // harvest; trailing chunks are beyond the moved range and already harvested). The model keeps its
@@ -126,10 +139,21 @@ namespace
         wxl::game::m2::M2Model(model).SetBuffer(buf, s.bodySize);
         h = reinterpret_cast<fmt::M2Header*>(buf);
 
+        out.phase = 3; // in-place raw record fixups
+        // Preserve this source's first vertex before native shared initialization can reuse it.
+        // This path has already validated MD21 and its supported version; stock v264 never enters.
+        if (h->vertices.count && !wxl::modern::assets::common::bones::CaptureVertexOrigin(h, buf, s.bodySize))
+            WLOG_WARN("vertex-origin-v1: source capture unavailable model=%p", model);
+        // Preserve source flags/blends/lookups before any compatibility normalization.
+        // A failed best-effort capture does not affect the existing load/render path.
+        if (!wxl::modern::assets::m2::material::SourceMaterials().CaptureRaw(
+                buf, buf, s.bodySize, s.txid, s.txidCount, s.skipMask, out.rollbackBuffer, size))
+            WLOG_WARN("m2native: source material capture unavailable; compatibility load continues");
         // --- in-place field deltas on the raw body ---
         // Two global-flag bits claim that the runtime owns the texture combo arrays, which would have
         // the teardown free interior pointers of this one buffer. We hand it nothing to free.
         h->globalFlags &= ~0x60u;
+        wxl::modern::ribbon::PrepareSourcePasses(buf,s.bodySize);
         FixSequencesRaw(buf, s.bodySize, h, out.extSeqPending);
         FixMaterialsRaw(buf, s.bodySize, h);
 
@@ -141,6 +165,7 @@ namespace
             h->numSkinProfiles = 1; // profile 0 = full detail; LOD chains need skin ownership first
         }
 
+        out.phase = 4; // record normalization
         // --- record normalization: one record shape for every source era, in place ---
         if (!NormalizeRecords(buf, s.bodySize, h, out.normalized))
         {
@@ -148,19 +173,71 @@ namespace
             return;
         }
 
+        out.phase = 5; // model-body offset-to-pointer walk
         // --- the offset->pointer walk ---
-        if (!WalkHeaderArrays(buf, s.bodySize, h)) { out.fail = "header walk rejected an array"; return; }
+        if (!WalkHeaderArrays(buf, s.bodySize, h, out)) { out.fail = "header walk rejected an array"; return; }
 
+        // A split-skeleton body can still own static material tracks. Record the texture-weight
+        // subset explicitly: losing an opaque weight makes SceneAnimate discard every body batch
+        // before material setup, while independently attached equipment continues to draw.
+        if (out.needsSkel && h->textureWeights.count && h->textureWeights.offset)
+        {
+            const auto* const tracks = reinterpret_cast<const fmt::M2TrackHeader*>(
+                static_cast<uintptr_t>(h->textureWeights.offset));
+            uint32_t preserved = 0;
+            int firstValue = 0;
+            for (uint32_t i = 0; i < h->textureWeights.count; ++i)
+            {
+                if (tracks[i].timestamps.count != 1 || !tracks[i].timestamps.offset ||
+                    tracks[i].values.count != 1 || !tracks[i].values.offset)
+                    continue;
+                const auto* const values = reinterpret_cast<const fmt::M2Array*>(
+                    static_cast<uintptr_t>(tracks[i].values.offset));
+                if (values[0].count != 1 || !values[0].offset) continue;
+                if (!preserved)
+                    firstValue = static_cast<int>(*reinterpret_cast<const int16_t*>(
+                        static_cast<uintptr_t>(values[0].offset)));
+                ++preserved;
+            }
+            if (preserved)
+            {
+                const char* const path = wxl::game::m2::M2Model(model).GetPathStem();
+                WLOG_INFO("m2native: '%s' preserved %u body-local constant texture weight(s)"
+                          " before companion .skel (first=%d)", path ? path : "<unnamed>",
+                          preserved, firstValue);
+            }
+        }
+
+        out.phase = 6; // post-walk texture/reference fixups
         // --- post-fixup injections on the now-pointer-based header ---
-        InjectTxidNames(h, s, out);
+        InjectTxidNames(h, s, out, wxl::game::m2::M2Model(model).GetPathStem());
         ClampRibbonRefs(h);
         ClampCameraRefs(h);
+        if (const char* path = wxl::game::m2::M2Model(model).GetPathStem())
+            wxl::modern::assets::m2::RepairEquipmentTextureLoops(
+                model, h, path);
 
         // Register for the live-engine half BEFORE the stock skin load can schedule its finalize: the
         // finalize-time contract rebuild (packed shaderId decode, textureUnitLookup synth) and the draw
         // fixups key off this registry.
         wxl::modern::assets::m2::RegisterNativeLoaded(model);
 
+        out.phase = 70; // companion skeleton load/splice
+        if (out.needsSkel && !SpliceSkeleton(model, h, out))
+        {
+            out.fail = "companion skeleton (.skel) could not be spliced";
+            return;
+        }
+
+        // Events stayed body-relative while the skeleton supplied sequence flags.
+        // Validate/rebase them before native initialization registers their callbacks.
+        if (!WalkDeferredEvents(buf, s.bodySize, h, out))
+        {
+            out.fail = "deferred body event walk rejected an array";
+            return;
+        }
+
+        out.phase = 8; // stock shared initialize
         // --- stock shared-initialize: skin select + name-based skin load + texture handles ---
         if (!wxl::game::Native<off::M2_SharedInitializeFn>(off::kSharedInitialize)(model))
         {
@@ -168,6 +245,7 @@ namespace
             return;
         }
 
+        out.phase = 9; // stock tail / runtime fields
         // Shadow-path animate gate. Initialize has just tallied, at +0x198, how many bones carry a
         // specific flag combination. The shadow-pass animate step reads that count: at zero it takes a
         // fast path that never rebuilds the bone palette, so the palette still holds an older frame's
@@ -219,6 +297,15 @@ namespace
             out->ok   = 0;
             out->fail = "access violation during native fill";
         }
+
+        if (!out->ok && out->rollbackBuffer && out->rawBuffer && out->rawSize)
+        {
+            std::memcpy(out->rawBuffer, out->rollbackBuffer, out->rawSize);
+            wxl::game::m2::M2Model(model).SetBuffer(out->rawBuffer, out->rawSize);
+            static_cast<off::M2Model*>(model)->flags &= ~1u;
+        }
+        std::free(out->rollbackBuffer);
+        out->rollbackBuffer = nullptr;
     }
 }
 
@@ -252,6 +339,8 @@ namespace wxl::runtime::m2native
         s.skippedOtherChunks = g_statSkipOther.load(std::memory_order_relaxed);
         s.externalSeqPending = g_statExtSeqPending.load(std::memory_order_relaxed);
         s.shadowGateForced   = g_statShadowGateForced.load(std::memory_order_relaxed);
+        s.skeletonsSpliced   = g_statSkelSpliced.load(std::memory_order_relaxed);
+        s.skeletonsParented  = g_statSkelParented.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -276,10 +365,14 @@ namespace wxl::runtime::m2native
 
         if (!out.ok)
         {
+            wxl::modern::assets::common::bones::ForgetPaletteMap(
+                reinterpret_cast<const fmt::M2Header*>(out.rawBuffer));
+            wxl::modern::assets::m2::material::SourceMaterials().Forget(out.rawBuffer);
             g_statFailed.fetch_add(1, std::memory_order_relaxed);
             wxl::modern::assets::m2::ForgetNativeLoaded(model); // undo a pre-Initialize registration
-            WLOG_WARN("m2native: '%s' native fill FAILED: %s (v=%u skips=0x%X)",
-                      stem, out.fail ? out.fail : "unknown", out.version, out.skipMask);
+            ReleaseSkeleton(model);
+            WLOG_WARN("m2native: '%s' native fill FAILED: %s (phase=%u v=%u skips=0x%X)",
+                      stem, out.fail ? out.fail : "unknown", out.phase, out.version, out.skipMask);
             return 0;
         }
 
@@ -293,6 +386,8 @@ namespace wxl::runtime::m2native
         if (out.skipMask & detail::kSkipOther)     g_statSkipOther.fetch_add(1, std::memory_order_relaxed);
         g_statExtSeqPending.fetch_add(out.extSeqPending, std::memory_order_relaxed);
         g_statShadowGateForced.fetch_add(out.shadowGateForced, std::memory_order_relaxed);
+        if (out.needsSkel)  g_statSkelSpliced.fetch_add(1, std::memory_order_relaxed);
+        if (out.skelParent) g_statSkelParented.fetch_add(1, std::memory_order_relaxed);
 
         // What this model needed reshaping, named by the normalizer table so a new record type shows up
         // in the log the moment its entry exists.
@@ -317,6 +412,12 @@ namespace wxl::runtime::m2native
         if (out.extSeqPending)
             WLOG_INFO("m2native: '%s' has %u streamed (.anim) sequence(s) -- bind pose until they arrive",
                       stem, out.extSeqPending);
+        if (out.needsSkel)
+            WLOG_INFO("m2native: '%s' armed from companion .skel (%u bones, %u sequences)",
+                      stem, out.skelBones, out.skelSequences);
+        if (out.skelInherited)
+            WLOG_INFO("m2native: '%s' inherited parent skeleton %u animation set",
+                      stem, out.skelParent);
 
         ev::M2NativeLoadArgs a{ model, out.version, out.texResolved, out.texUnresolved, out.skipMask };
         wxl_modern_m2::g_api->Emit(uint32_t(ev::Event::OnM2NativeLoad), &a);

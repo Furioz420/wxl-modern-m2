@@ -32,6 +32,8 @@
 
 namespace wxl::runtime::m2native::detail
 {
+    struct HeaderArray;
+
     inline uint32_t Rd32(const void* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
     inline uint16_t Rd16(const void* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
     inline void     Wr32(void* p, uint32_t v) { std::memcpy(p, &v, 4); }
@@ -68,6 +70,7 @@ namespace wxl::runtime::m2native::detail
         uint32_t txidCount;
         uint32_t sfidFirst;
         uint32_t sfidCount;
+        uint32_t skid;
         uint32_t skipMask;
     };
 
@@ -76,12 +79,21 @@ namespace wxl::runtime::m2native::detail
     {
         int      ok;
         uint32_t version;
+        uint32_t phase; // last native-fill phase entered; survives an SEH failure for diagnosis
+        uint8_t* rawBuffer;      // original MD21 allocation, restored if any phase rejects it
+        uint8_t* rollbackBuffer; // byte-for-byte copy made before the in-place conversion
+        uint32_t rawSize;
         uint32_t texResolved;
         uint32_t texUnresolved;
         uint32_t skipMask;
         uint32_t extSeqPending;
         uint32_t shadowGateForced; // 1 when the shared runtime's animate-gate count had to be lifted off zero
         uint32_t shadowGateAfter;  // that same animate-gate count, read back immediately after the write
+        uint32_t needsSkel;
+        uint32_t skelBones;
+        uint32_t skelSequences;
+        uint32_t skelParent;
+        uint32_t skelInherited;
         NormalizeReport normalized; // records rewritten to the target shape, per kRecordNormalizers entry
         const char* fail; // static failure reason when ok == 0
     };
@@ -97,7 +109,7 @@ namespace wxl::runtime::m2native::detail
     /// M2Fixups: material deltas in place (blend-mode clamp into the client's 7-entry table, flag mask).
     void FixMaterialsRaw(uint8_t* base, uint32_t size, wxl::structure::m2::M2Header* h);
     /// M2Fixups: points each hardcoded texture with no inline name at its TXID-resolved client path.
-    void InjectTxidNames(wxl::structure::m2::M2Header* h, const Scan& s, Outcome& out);
+    void InjectTxidNames(wxl::structure::m2::M2Header* h, const Scan& s, Outcome& out, const char* modelPath);
     /// M2Fixups: clamps each ribbon's texture/material reference values into the header tables.
     void ClampRibbonRefs(wxl::structure::m2::M2Header* h);
     /// M2Fixups: drops each camera reference that points past the camera array (the source exporter
@@ -113,7 +125,18 @@ namespace wxl::runtime::m2native::detail
     /// M2WalkOwned: resolves every header array (and the arrays nested inside the records they point
     /// at) from body-relative offsets into real pointers. Records are already target-shaped by then, so
     /// one record map serves every source era. Returns true when every array passed its bounds check.
-    bool WalkHeaderArrays(uint8_t* base, uint32_t size, wxl::structure::m2::M2Header* h);
+    bool WalkHeaderArrays(uint8_t* base, uint32_t size, wxl::structure::m2::M2Header* h,
+                          Outcome& out);
+
+    // Resolve body event tracks after the companion sequence table is available.
+    bool WalkDeferredEvents(uint8_t* base, uint32_t size, wxl::structure::m2::M2Header* h,
+                            const Outcome& out);
+
+    bool WalkOneArray(uint8_t* base, uint32_t size, wxl::structure::m2::M2Header* h,
+                      const HeaderArray& entry,
+                      const wxl::structure::m2::M2Sequence* sequences, uint32_t sequenceCount);
+
+    bool SpliceSkeleton(void* model, wxl::structure::m2::M2Header* h, Outcome& out);
 
     // Skin profiles still arrive through the stock sibling loader and are reshaped later, on the live
     // parsed profile. Owning that parse plugs in here as its own record map plus normalizer table over

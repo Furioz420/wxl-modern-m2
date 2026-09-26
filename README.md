@@ -26,7 +26,8 @@ what's intentionally out of scope for now, and the safety/interface contract).
   pass down a path that never refreshes the pose.
 - **Effect and hit-test fixes**: particle/ribbon blending and triangle hit-testing corrected so effects
   render as intended and clicking selects the right thing.
-- **Crash-safe**: malformed input is a logged failure, never a crash.
+- **Extended sequence resolution**: modern animation IDs above the Wrath AnimationData ceiling resolve against the loaded M2, while an optional movement extension can own the final result through the versioned `wxl.m2-animation` interface.
+- **Input validation**: unsupported or malformed input is rejected in the validated loader paths. Runtime smoke testing is still required.
 
 ## Requirements
 
@@ -35,10 +36,7 @@ guessing, and says so in the log.
 
 ## Building
 
-This extension builds against [wxl-core](https://github.com/WarcraftXL/wxl-core) (branch `v1.1`), which
-auto-discovers any folder dropped into its `extensions/` directory, so there's no project file of its own
-needed here. See `.github/workflows/release.yml` for the exact steps; every push to `main` builds
-`wxl-modern-m2.dll` and publishes it as a release.
+This source snapshot follows WXL integration commit `db5f1b5`. Build it with the matching core/API revision, Modern BLP support, and intended M2/DB2 data; the moving upstream `v1.1` branch is not an exact compatibility pin. The imported `.github/workflows/release.yml` publishes from `main`, so keep this PR in draft until its core pin, Hub package contents, and runtime route are validated.
 
 ## License
 

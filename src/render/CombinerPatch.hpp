@@ -29,6 +29,8 @@ namespace wxl::runtime::m2combiner
      * @param batchIndex  The batch's final position in that skin's batch array.
      */
     void MarkAddAlphaBatch(void* skin, uint32_t batchIndex);
+    // A corrected translation must not inherit a stale tag from a reused skin address.
+    void UnmarkAddAlphaBatch(void* skin, uint32_t batchIndex);
 
     /** @brief True if MarkAddAlphaBatch tagged this exact (skin, batchIndex) pair. */
     bool IsAddAlphaBatch(void* skin, uint32_t batchIndex);

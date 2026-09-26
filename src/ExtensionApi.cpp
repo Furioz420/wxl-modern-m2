@@ -20,5 +20,10 @@ namespace wxl_modern_m2
 {
     const WXL_Api* g_api = nullptr;
     const WXL_FdidApi* g_fdid = nullptr;
+    const WXL_RetailDb2Api* g_retailDb2 = nullptr;
+    const WXL_RetailSpellDb2Api* g_retailSpellDb2 = nullptr;
+    const WXL_FrameScriptApi* g_frameScript = nullptr;
+    const WXL_NetworkApi* g_network = nullptr;
+    const WXL_StorageApi* g_storage = nullptr;
     const WXL_M2ArenaApi* g_arena = nullptr;
 }

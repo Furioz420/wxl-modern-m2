@@ -19,6 +19,7 @@
 #include "AssetRegistry.hpp"
 #include "BoneBudget.hpp"
 #include "../ExtensionApi.hpp"
+#include "../load/NativeLoad.hpp"
 #include "Skin.hpp"
 
 #include "engine/events/Event.hpp"
@@ -30,7 +31,12 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <mutex>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace wxl::modern::assets::m2
@@ -44,6 +50,57 @@ namespace wxl::modern::assets::m2
     {
         common::AssetRegistry g_registry;
 
+        constexpr uint32_t kTextureTransformStride = 0x3C;
+        constexpr std::array<uint32_t, 3> kTextureTrackOffsets{
+            0x00, 0x14, 0x28
+        };
+        constexpr uint32_t kMinTextureLoopMs = 100;
+        constexpr uint32_t kMaxTextureLoopMs = 600000;
+
+        // Repaired loop tables cannot be appended to the already-relocated
+        // model arena. Retain one replacement per live model.
+        std::mutex g_textureLoopMutex;
+        std::unordered_map<void*, std::unique_ptr<uint32_t[]>>
+            g_textureLoopTables;
+
+        bool IsEquipmentPath(const char* path)
+        {
+            constexpr char kPrefix[] = "item\\objectcomponents\\";
+            return path &&
+                   _strnicmp(path, kPrefix, sizeof(kPrefix) - 1) == 0;
+        }
+
+        uint32_t TextureTrackDuration(const fmt::M2TrackHeader& track)
+        {
+            if (track.globalSequence < 0 || !track.timestamps.count ||
+                !track.timestamps.offset || track.timestamps.count > 0x1000)
+                return 0;
+
+            const auto* outer = reinterpret_cast<const fmt::M2Array*>(
+                static_cast<uintptr_t>(track.timestamps.offset));
+            uint32_t duration = 0;
+            for (uint32_t i = 0; i < track.timestamps.count; ++i)
+            {
+                if (outer[i].count < 2 || outer[i].count > 0x10000 ||
+                    !outer[i].offset)
+                    continue;
+                const auto* timestamps = reinterpret_cast<const uint32_t*>(
+                    static_cast<uintptr_t>(outer[i].offset));
+                duration = std::max(
+                    duration, timestamps[outer[i].count - 1]);
+            }
+            return duration >= kMinTextureLoopMs &&
+                           duration <= kMaxTextureLoopMs
+                       ? duration
+                       : 0;
+        }
+
+        void ForgetTextureLoops(void* model)
+        {
+            const std::lock_guard lock(g_textureLoopMutex);
+            g_textureLoopTables.erase(model);
+        }
+
         /**
          * @brief Drops any registration left on this model pointer before the native reader fills it.
          *
@@ -54,7 +111,12 @@ namespace wxl::modern::assets::m2
         void __cdecl OnModelLoadPre(void* /*user*/, const void* argsRaw)
         {
             const auto& a = *static_cast<const ev::ModelLoadArgs*>(argsRaw);
+            // Model objects are reused. The outgoing header owns any two-phase palette map stored
+            // during its skin rebuild, so discard it before the incoming model replaces the header.
+            bn::ForgetPaletteMap(m2::M2Model(a.model).GetHeader());
             g_registry.Forget(a.model);
+            ForgetTextureLoops(a.model);
+            wxl::runtime::m2native::ReleaseSkeleton(a.model);
         }
 
         /**
@@ -130,9 +192,101 @@ namespace wxl::modern::assets::m2
     void ForgetNativeLoaded(void* model)
     {
         if constexpr (wxl_modern_m2::kEnabled)
+        {
             g_registry.Forget(model);
+            ForgetTextureLoops(model);
+        }
         else
             (void)model;
+    }
+
+    bool IsNativeLoaded(void* model)
+    {
+        if constexpr (wxl_modern_m2::kEnabled)
+            return g_registry.Contains(model);
+        else
+            return (void)model, false;
+    }
+
+    uint32_t RepairEquipmentTextureLoops(void* model,
+                                         fmt::M2Header* header,
+                                         const char* path)
+    {
+        if (!model || !header || !IsEquipmentPath(path) ||
+            !header->textureTransforms.count ||
+            !header->textureTransforms.offset)
+            return 0;
+
+        std::vector<uint32_t> loops;
+        if (header->globalLoops.count && header->globalLoops.offset)
+        {
+            const auto* source = reinterpret_cast<const uint32_t*>(
+                static_cast<uintptr_t>(header->globalLoops.offset));
+            loops.assign(source, source + header->globalLoops.count);
+        }
+
+        struct Repair
+        {
+            fmt::M2TrackHeader* track;
+            uint16_t loop;
+        };
+        std::vector<Repair> repairs;
+        auto* transforms = reinterpret_cast<uint8_t*>(
+            static_cast<uintptr_t>(header->textureTransforms.offset));
+        for (uint32_t i = 0; i < header->textureTransforms.count; ++i)
+        {
+            uint8_t* transform =
+                transforms + i * kTextureTransformStride;
+            for (uint32_t offset : kTextureTrackOffsets)
+            {
+                auto* track = reinterpret_cast<fmt::M2TrackHeader*>(
+                    transform + offset);
+                if (track->globalSequence < 0 ||
+                    track->globalSequence > 1)
+                    continue;
+                const uint32_t duration = TextureTrackDuration(*track);
+                if (!duration) continue;
+
+                uint16_t privateLoop = 0xFFFF;
+                for (size_t n = 2; n < loops.size(); ++n)
+                    if (loops[n] == duration)
+                    {
+                        privateLoop = static_cast<uint16_t>(n);
+                        break;
+                    }
+                if (privateLoop == 0xFFFF)
+                {
+                    while (loops.size() < 2) loops.push_back(duration);
+                    if (loops.size() >= 0xFFFE) continue;
+                    loops.push_back(duration);
+                    privateLoop = static_cast<uint16_t>(loops.size() - 1);
+                }
+                repairs.push_back({track, privateLoop});
+            }
+        }
+        if (repairs.empty()) return 0;
+
+        if (loops.size() != header->globalLoops.count)
+        {
+            auto replacement = std::make_unique<uint32_t[]>(loops.size());
+            std::copy(loops.begin(), loops.end(), replacement.get());
+            uint32_t* replacementData = replacement.get();
+            {
+                const std::lock_guard lock(g_textureLoopMutex);
+                g_textureLoopTables[model] = std::move(replacement);
+            }
+            header->globalLoops.count = static_cast<uint32_t>(loops.size());
+            header->globalLoops.offset = static_cast<uint32_t>(
+                reinterpret_cast<uintptr_t>(replacementData));
+        }
+        for (const Repair& repair : repairs)
+            repair.track->globalSequence =
+                static_cast<int16_t>(repair.loop);
+
+        WLOG_INFO(
+            "modern-assets: '%s' isolated %u equipment texture-transform loop(s)",
+            path, static_cast<unsigned>(repairs.size()));
+        return static_cast<uint32_t>(repairs.size());
     }
 }
 
@@ -142,6 +296,7 @@ namespace wxl_modern_m2
     {
         namespace ev = wxl::events;
         namespace m2 = wxl::modern::assets::m2;
+
 
         g_api->Subscribe(uint32_t(ev::Event::OnModelLoadPre), &m2::OnModelLoadPre, nullptr);
         g_api->Subscribe(uint32_t(ev::Event::OnM2SkinFinalize), &m2::OnSkinFinalize, nullptr);

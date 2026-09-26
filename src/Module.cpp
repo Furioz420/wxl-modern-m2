@@ -16,6 +16,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "ExtensionApi.hpp"
+#include "compat/GilneanPreview.hpp"
+#include "wxl/EventScript.hpp"
 
 const WXL_PluginInfo* __cdecl WXL_Query(void)
 {
@@ -34,6 +36,7 @@ int __cdecl WXL_Load(const WXL_Api* api)
     if (!api || api->apiVersion != WXL_API_VERSION) return 0;
 
     wxl_modern_m2::g_api = api;
+    wxl::ext::EventScript::Bind(api);
 
     // M2Draw is unconditional: the 32-bit start-index expansion and ribbon multi-texture fold are
     // stock-compatibility fixes, not modern-only features (ex core render's InstallM2DrawHooks(),
@@ -54,9 +57,54 @@ int __cdecl WXL_Load(const WXL_Api* api)
         wxl_modern_m2::InstallM2CompatLoader();
         wxl_modern_m2::InstallM2Native();
         wxl_modern_m2::InstallModernM2();
+
+        if (wxl_modern_m2::ConfigBool("WXL_M2_RETAIL_CHARACTERS", false))
+        {
+            wxl_modern_m2::InstallHdSwitch();
+            wxl_modern_m2::InstallCharacterGeosets();
+            wxl_modern_m2::InstallCharacterSheet();
+            wxl_modern_m2::InstallGilneanPreview();
+            wxl_modern_m2::InstallCharacterCustomize();
+            wxl_modern_m2::InstallServerAppearance();
+            wxl_modern_m2::InstallCharacterTextures();
+            wxl_modern_m2::InstallModelIndices();
+            api->Log(WXL_LOG_INFO, "wxl-modern-m2",
+                     "native Retail character-model pipeline enabled");
+        }
+        else
+            api->Log(WXL_LOG_INFO, "wxl-modern-m2",
+                     "native Retail character-model pipeline disabled by configuration");
+
+        if (!wxl_modern_m2::InstallExtendedAnimations())
+            api->Log(WXL_LOG_WARN, "wxl-modern-m2",
+                     "extended animation resolver unavailable");
+
+        if (wxl_modern_m2::ConfigBool("WXL_M2_RETAIL_ITEMS", true))
+        {
+            // Provider and DBC catalogs precede the accessors/controllers that consume them.
+            wxl_modern_m2::InstallRetailSkinProvider();
+            wxl_modern_m2::InstallNativeItemDbc();
+            wxl_modern_m2::InstallItemVariantBridge();
+            wxl_modern_m2::InstallRetailItemAccessors();
+            wxl_modern_m2::InstallCharModel();
+            wxl_modern_m2::InstallRetailEquipment();
+        }
+        else
+            api->Log(WXL_LOG_INFO, "wxl-modern-m2",
+                     "retail items and 3D collections disabled by configuration");
+
+        if (!wxl_modern_m2::InstallLegacySpellPresentation())
+            api->Log(WXL_LOG_WARN, "wxl-modern-m2", "legacy spell presentation adapter unavailable; native data retained");
+
+        if (wxl_modern_m2::ConfigBool("WXL_M2_RETAIL_SPELLS", true))
+            wxl_modern_m2::InstallRetailSpellVisuals();
+        else
+            api->Log(WXL_LOG_INFO, "wxl-modern-m2",
+                     "retail spell-model presentation disabled by configuration");
         wxl_modern_m2::InstallM2LodVariant();
     }
 
-    api->Log(WXL_LOG_INFO, "wxl-modern-m2", "native M2 reader active");
+    api->Log(WXL_LOG_INFO, "wxl-modern-m2",
+             "native M2 reader active (extension-owned retail item bridge ready)");
     return 1;
 }
