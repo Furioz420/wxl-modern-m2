@@ -41,3 +41,13 @@ This source snapshot follows WXL integration commit `db5f1b5`. Build it with the
 ## License
 
 GPL-3.0-or-later. See the license header in every source file.
+
+## Integration and release checks
+
+Build `wxl-modern-m2` as a Win32 Release target against the exact core and shared M2/BLP source APIs used by this snapshot. The current workflow stages only the DLL; `wxl-modern-m2.cfg`, modern M2/skin/skeleton files, textures, and compatible DB2 catalogs are separate reviewed inputs. The modern loader can be evaluated without replacing the original Wrath model files; retail equipment and spell presentation additionally need matching data and provider services.
+
+Test one original Wrath model and one optional HD model, then inspect body textures, helmet/hair geosets, draw/sheath, shadows, and particle/ribbon effects. Run a Dalaran/Stormwind return route and inspect crash/memory logs. Keep a full DLL/config/asset rollback. The shared integration target compiles, but this large source snapshot still needs staged review, a pinned standalone build, runtime acceptance, and reconciliation with the existing WarcraftXL Modern M2 PR before release. `main` currently auto-publishes against moving upstream `v1.1`.
+
+## Credits
+
+The WXL core ABI and original module interfaces come from WarcraftXL contributors. The local v1.1 integration commits in this snapshot are attributed to Furioz in the integration history. Preserve source-file notices and the GPL-3.0-or-later `LICENSE` when redistributing source or binaries.
