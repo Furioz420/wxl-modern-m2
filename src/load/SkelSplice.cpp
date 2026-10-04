@@ -49,6 +49,7 @@
 #include "M2NativeInternal.hpp"
 #include "M2WalkLayout.hpp"
 #include "NativeLoad.hpp"
+#include "EventTrackSlots.hpp"
 
 #include "../ExtensionApi.hpp"
 
@@ -126,6 +127,7 @@ namespace
     /// The companion bytes a spliced model's header now points into, held for that model's lifetime.
     std::mutex g_mutex;
     std::unordered_map<void*, uint8_t*> g_owned;
+    std::unordered_map<void*, wxl::runtime::m2native::detail::EventSlots> g_eventSlots;
 
     /**
      * ModelFilePath.db2 can resolve an M2 FileDataID, but Retail companion skeletons are not model
@@ -239,6 +241,23 @@ namespace
 
 namespace wxl::runtime::m2native::detail
 {
+    bool PadEventSlots(void* model, fmt::M2Header* h)
+    {
+        try
+        {
+            EventSlots slots;
+            if (!PrepareEventSlots(h, slots)) return false;
+            bool padded = false;
+            for (const auto& list : slots) padded |= !list.empty();
+            if (!padded) return true;
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto& owned = g_eventSlots[model];
+            owned = std::move(slots);
+            PublishEventSlots(h, owned);
+            return true;
+        }
+        catch (...) { return false; }
+    }
     namespace
     {
         /// Resolves one companion's three payloads into real pointers, each against its own payload as
@@ -437,6 +456,7 @@ namespace wxl::runtime::m2native
         uint8_t* bytes = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            g_eventSlots.erase(model);
             auto it = g_owned.find(model);
             if (it == g_owned.end()) return;
             bytes = it->second;

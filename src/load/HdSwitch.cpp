@@ -44,6 +44,7 @@
 //   request for a skin file with a name assembled out of the model's, and nobody ships that file.
 
 #include "../ExtensionApi.hpp"
+#include "HdAliasPolicy.hpp"
 
 #include "wxl/AppearanceApi.h"
 #include "wxl/StorageApi.h"
@@ -264,9 +265,15 @@ namespace
         const size_t servedStem = StemLength(servedFile);
         if (!servedStem) return 0;
 
-        // Already the answer: the client asks for its companions by the name it was served, so a claim
-        // on our own output would never settle.
-        if (servedStem == stem && MatchesFold(file, servedFile, stem)) return 0;
+        // An equal stem can still name the old HD archive namespace. Canonicalize
+        // that exact family once; a request for our canonical output must settle.
+        if (servedStem == stem && MatchesFold(file, servedFile, stem))
+        {
+            const auto canonical = wxl_modern_m2::CanonicalHdAlias(name, served);
+            if (canonical.empty() || canonical.size() + 1 > outCap) return 0;
+            std::memcpy(out, canonical.c_str(), canonical.size() + 1);
+            return 1;
+        }
 
         // And only what the served name is a continuation of. Being under a race's directory is not
         // enough: every one of that race's TEXTURES lives there too, and their stems begin with the

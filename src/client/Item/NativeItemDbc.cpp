@@ -29,6 +29,7 @@ namespace wxl::client::nativeitemdbc
         std::unordered_map<uint32_t, ItemRow> g_itemRows;
         std::unordered_set<uint32_t> g_displayIds;
         std::unordered_map<uint32_t, std::array<uint32_t, 2>> g_helmetVisibility;
+        std::unordered_set<uint32_t> g_displaysWithoutModel;
         std::unordered_map<uint32_t, std::string> g_displayIcons;
     }
 
@@ -66,6 +67,11 @@ namespace wxl::client::nativeitemdbc
     bool SupplementalDisplayExists(uint32_t displayId) noexcept
     {
         return g_displayIds.contains(displayId);
+    }
+
+    bool SupplementalDisplayHasNoModel(uint32_t displayId) noexcept
+    {
+        return g_displaysWithoutModel.contains(displayId);
     }
 
     const char* SupplementalDisplayIcon(uint32_t displayId) noexcept
@@ -228,6 +234,7 @@ namespace
         std::unordered_map<uint32_t, std::string> indexed;
         indexed.reserve(header.records);
         std::unordered_map<uint32_t, std::array<uint32_t, 2>> helmetVisibility;
+        std::unordered_set<uint32_t> displaysWithoutModel;
         std::unordered_set<uint32_t> displayIds;
         displayIds.reserve(header.records);
         uint32_t minId = (std::numeric_limits<uint32_t>::max)();
@@ -243,6 +250,14 @@ namespace
             const uint32_t id = row[0];
             if (!id || !displayIds.insert(id).second) return false;
             helmetVisibility.emplace(id, std::array<uint32_t, 2>{row[13], row[14]});
+            bool hasModel = false;
+            for (uint32_t field : {1u, 2u}) {
+                const auto offset = row[field];
+                if (offset >= header.stringBytes ||
+                    !HasTerminator(strings + offset, header.stringBytes - offset)) return false;
+                hasModel |= strings[offset] != '\0';
+            }
+            if (!hasModel) displaysWithoutModel.insert(id);
 
             minId = (std::min)(minId, id);
             maxId = (std::max)(maxId, id);
@@ -295,6 +310,7 @@ namespace
         }
 
         wxl::client::nativeitemdbc::g_helmetVisibility = std::move(helmetVisibility);
+        wxl::client::nativeitemdbc::g_displaysWithoutModel = std::move(displaysWithoutModel);
         wxl::client::nativeitemdbc::g_displayIcons =
             std::move(indexed);
         wxl::client::nativeitemdbc::g_displayIds =

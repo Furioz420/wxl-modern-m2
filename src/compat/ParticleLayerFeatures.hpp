@@ -62,4 +62,50 @@ inline bool CaptureLayerFeatures(const uint8_t* body,uint32_t bodySize,
     }
     return at==size&&(seen&1)!=0;
 }
+// Limited native-sprite composition experiment. Native simulation owns the global
+// 0x3090 model behavior. Only neutral per-emitter metadata is admitted; TXAC on
+// another mesh/emitter must not disqualify a neutral sprite. No EXP2/edge/depth
+// chunks are interpreted by this path. TXAC 1/1 is captured separately for the
+// opt-in material-family approximation; it never enables neutral admission.
+inline void CaptureNativeSpriteLayers(const uint8_t* body,uint32_t bodySize,
+ const uint8_t* container,uint32_t size,ModelSource& model) {
+ model.nativeSpriteLayers.clear();
+ model.spriteLayerKinds.clear();
+ model.txac11SpriteMask=0;
+ // Capture metadata for the guarded Blood Plague path too; generic admission
+ // still requires 0x3090 in DecodeNativeSprites.
+ if(!body || !container || (model.globalFlags!=0x3090 && model.globalFlags!=0x2090) || model.innerVersion!=274 ||
+    model.particleCapture!=ParticleCapture::Captured || model.particles.empty())return;
+ auto u32=[](const uint8_t* p){uint32_t v;std::memcpy(&v,p,4);return v;};
+ std::vector<uint8_t> eligible(model.particles.size(),1);
+ std::vector<uint8_t> kinds(model.particles.size(),1);
+ uint32_t at=0,seen=0,txac11=0;
+ while(at<=size && size-at>=8) {
+  const auto length=u32(container+at+4);if(length>size-at-8)return;
+  const auto* tag=container+at;const auto* data=tag+8;unsigned bit=0;
+  if(!std::memcmp(tag,"MD21",4)){bit=1;if(length!=bodySize)return;}
+  else if(!std::memcmp(tag,"TXID",4)){bit=2;if(length!=4*model.textures.size())return;}
+  else if(!std::memcmp(tag,"SFID",4)){bit=4;if(length%4)return;}
+  else if(!std::memcmp(tag,"TXAC",4)) {
+   bit=8;if(length!=2*(model.materials.size()+model.particles.size()))return;
+   for(size_t i=0;i<eligible.size();++i) {
+    const auto offset=2*(model.materials.size()+i);
+    if(data[offset] || data[offset+1])eligible[i]=0;
+    kinds[i]=eligible[i]?1:(data[offset]==1 && data[offset+1]==1?2:0);
+    if(i<32 && data[offset]==1 && data[offset+1]==1)txac11|=1u<<i;
+   }
+  } else return;
+  if(seen&bit)return;seen|=bit;at+=8+length;
+ }
+ if(at!=size || !(seen&1))return;
+ for(size_t i=0;i<eligible.size();++i)for(unsigned field:{0x18u,0x20u}) {
+  const auto& p=model.particles[i];const auto n=p.U32(field),o=p.U32(field+4);
+  if(n && (n!=1 || !o || o>=bodySize || body[o])){eligible[i]=0;kinds[i]=0;if(i<32)txac11&=~(1u<<i);}
+ }
+ model.nativeSpriteLayers=std::move(eligible);
+ model.spriteLayerKinds=std::move(kinds);
+ model.txac11SpriteMask=txac11;
+ model.particleMultipliers.assign(model.particles.size(),{1.f,1.f});
+}
+
 }

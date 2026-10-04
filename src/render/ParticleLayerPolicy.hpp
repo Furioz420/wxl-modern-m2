@@ -9,10 +9,10 @@ namespace wxl::modern::particlelayers {
     inline float Scroll(uint16_t raw) noexcept {return float(raw&0x7fff)*(raw&0x8000?-1.0f:1.0f)/512.0f;}
     struct Recipe { pm::Combine combine; std::array<uint16_t,3> indices; std::array<float,2> scale,multipliers; std::array<pm::Vec2,2> mid,range; };
     // Structural recipe extraction only. Callers MUST first establish their admission contract.
-    inline bool DecodeRecipe(const assets::m2::material::ModelSource& model,unsigned index,Recipe& out) noexcept {
+    inline bool DecodeRecipe(const assets::m2::material::ModelSource& model,unsigned index,Recipe& out,bool alphaBlend=false) noexcept {
         if(index>=model.particles.size())return false;
         const auto& p=model.particles[index];
-        if(!p.MultiTexture() || p.Blend()!=7 || (p.Flags()&0x80100000u) || index>=model.particleMultipliers.size())return false;
+        if(!p.MultiTexture() || (p.Blend()!=7 && !(alphaBlend && p.Blend()==2)) || (p.Flags()&0x80100000u) || index>=model.particleMultipliers.size())return false;
         Recipe r{};r.combine=(p.Flags()&0x40000000u)?pm::Combine::ThreeColorThreeAlpha:pm::Combine::TwoColorThreeAlpha;
         r.multipliers=model.particleMultipliers[index];
         for(unsigned stage=0;stage<3;++stage) {
@@ -35,6 +35,24 @@ namespace wxl::modern::particlelayers {
             (model.globalFlags&0x1000) || model.particleCapture!=mat::ParticleCapture::Captured)return false;
         return DecodeRecipe(model,index,out);
     }
+    inline bool DecodeNativeSprites(bool enabled,const assets::m2::material::ModelSource& model,unsigned index,Recipe& out) noexcept {
+        if(!enabled || model.containerMagic!=wxl::structure::m2::kMagicMD21 || model.innerVersion!=274 ||
+           model.globalFlags!=0x3090 || model.particleCapture!=assets::m2::material::ParticleCapture::Captured ||
+           index>=model.nativeSpriteLayers.size() || !model.nativeSpriteLayers[index])return false;
+        return DecodeRecipe(model,index,out,true);
+    }
+    // Material-family trial, independent of model name and texture IDs. Unknown
+    // metadata is rejected by capture; GPU shader/texture/blend guards still apply.
+    // Kind 2 retains native mask UV with approximate extra-layer UV composition.
+    inline bool DecodeSpriteMaterials(bool enabled,
+        const assets::m2::material::ModelSource& model,unsigned index,Recipe& out) noexcept {
+        if(!enabled || model.containerMagic!=wxl::structure::m2::kMagicMD21 ||
+           model.innerVersion!=274 || (model.globalFlags!=0x2090 && model.globalFlags!=0x3090) ||
+           model.particleCapture!=assets::m2::material::ParticleCapture::Captured ||
+           index>=model.spriteLayerKinds.size() ||
+           (model.spriteLayerKinds[index]!=1 && model.spriteLayerKinds[index]!=2))return false;
+        return DecodeRecipe(model,index,out,true);
+    }
     inline bool DecodeRiftNativeSprites(bool enabled,bool exactPath,
         const assets::m2::material::ModelSource& model,unsigned index,Recipe& out) noexcept {
         namespace mat=assets::m2::material;
@@ -48,6 +66,48 @@ namespace wxl::modern::particlelayers {
         return DecodeRecipe(model,index,out);
     }
     inline uint32_t Mix(uint32_t x) noexcept { x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;return x^(x>>16); }
+    // Exact-source experiment: keep native mask UV and use the existing extra-layer
+    // scrolling approximation. TXAC's additional UV shader is NOT implemented.
+    // Generic admission above remains unchanged and rejects these emitters.
+    inline bool DecodeBloodSmokeApprox(bool enabled,bool exactPath,
+        const assets::m2::material::ModelSource& model,unsigned index,Recipe& out) noexcept {
+        if(!enabled || !exactPath || model.containerMagic!=wxl::structure::m2::kMagicMD21 ||
+           model.innerVersion!=274 || model.globalFlags!=0x3090 ||
+           model.particleCapture!=assets::m2::material::ParticleCapture::Captured ||
+           model.particles.size()!=7 || model.textures.size()!=6 || model.textureFileDataIds.size()!=6 ||
+           model.txac11SpriteMask!=0x42 || (index!=1 && index!=2 && index!=5 && index!=6) ||
+           model.textureFileDataIds[1]!=1601219 || model.textureFileDataIds[2]!=1602396)return false;
+        const auto& p=model.particles[index];
+        // These two neutral-TXAC emitters were excluded by the previous smoke-only
+        // launcher. Use the existing guarded path, without enabling other models.
+        if(index==2 || index==5) {
+            if(model.textureFileDataIds[3]!=1601199 || model.textureFileDataIds[4]!=1601200 ||
+               p.Flags()!=(index==2?0x70831011u:0x70830011u) || p.Blend()!=7 ||
+               p.U16(0x16)!=4227 || p.bytes[0x2c]!=6 || p.bytes[0x2d]!=3)return false;
+            return DecodeNativeSprites(true,model,index,out);
+        }
+        if(p.Flags()!=(index==1?0x70831011u:0x70830011u) || p.Blend()!=2 ||
+           p.U16(0x16)!=2113 || p.bytes[0x2c]!=32 || p.bytes[0x2d]!=16)return false;
+        return DecodeRecipe(model,index,out,true);
+    }
+    // Separate opt-in for the captured target disease. The grey bubble emitter
+    // remains native. TXAC UV composition is approximate, as for Blood Boil.
+    inline bool DecodeBloodPlagueApprox(bool enabled,bool exactPath,
+        const assets::m2::material::ModelSource& model,unsigned index,Recipe& out) noexcept {
+        if(!enabled || !exactPath || model.containerMagic!=wxl::structure::m2::kMagicMD21 ||
+           model.innerVersion!=274 || model.globalFlags!=0x2090 ||
+           model.particleCapture!=assets::m2::material::ParticleCapture::Captured ||
+           index!=1 || model.particles.size()!=2 || model.textures.size()!=3 ||
+           model.textureFileDataIds.size()!=3 || model.textureFileDataIds[0]!=667363 ||
+           model.textureFileDataIds[1]!=1601219 || model.textureFileDataIds[2]!=1601220 ||
+           model.txac11SpriteMask!=2)return false;
+        const auto& p=model.particles[index];
+        if(p.Flags()!=0x70830011u || p.Blend()!=2 || p.U16(0x16)!=2113 ||
+           p.bytes[0x2c]!=32 || p.bytes[0x2d]!=16)return false;
+        const uint16_t scroll[8]={0,32896,0,32896,0,0,0,0};
+        for(unsigned i=0;i<8;++i)if(p.U16(0x1dc+2*i)!=scroll[i])return false;
+        return DecodeRecipe(model,index,out,true);
+    }
     inline float Unit(uint32_t x) noexcept {return float(Mix(x)>>8)*(1.0f/16777216.0f);}
     // Experimental deterministic per-slot randomization; never advances the engine RNG.
     // Reused pool slots repeat their seed. This is NOT donor RNG sequence parity.

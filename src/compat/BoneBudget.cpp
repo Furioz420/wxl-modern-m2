@@ -776,6 +776,16 @@ namespace wxl::modern::assets::common::bones
             return false;
         }
 
+        // The compact and geometry paths both index four property bytes per skin
+        // vertex. Some native skins advertise fewer property records. Do not read
+        // their tail or invent bone slots; leave that contract to the native path.
+        if (skin->boneCount < skin->vertexCount)
+        {
+            WLOG_WARN("modern-assets: '%s' bone properties=%u shorter than skin vertices=%u; skipping bone rewrite",
+                      name ? name : "", skin->boneCount, skin->vertexCount);
+            return false;
+        }
+
         StabilizeCharacterVertices(md, skin,
                                    name ? std::string_view{ name } : std::string_view{});
 

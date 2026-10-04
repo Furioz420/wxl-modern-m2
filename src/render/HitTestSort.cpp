@@ -17,6 +17,8 @@
 #include "../ExtensionApi.hpp"
 
 #include "offsets/game/M2.hpp"
+#include "common/Mem.hpp"
+#include "HitBoundsGuard.hpp"
 
 #include <windows.h>
 
@@ -155,6 +157,21 @@ namespace wxl_modern_m2
 {
     bool InstallM2SceneHitTestSort()
     {
+        namespace bounds = wxl::modern::hitbounds;
+        auto* site = reinterpret_cast<void*>(bounds::kSite);
+        if (std::memcmp(site, bounds::kOriginal, sizeof(bounds::kOriginal)) == 0)
+        {
+            uint8_t patch[sizeof(bounds::kOriginal)];
+            std::memset(patch, 0x90, sizeof(patch));
+            patch[0] = 0xE9;
+            const uint32_t relative = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&bounds::SelectBounds)
+                - bounds::kSite - 5);
+            std::memcpy(patch + 1, &relative, sizeof(relative));
+            if (!wxl::mem::Patch(site, patch, sizeof(patch)))
+                WLOG_WARN("M2 hit bounds: could not install sequence bounds guard");
+            else WLOG_INFO("M2 hit bounds: invalid animation uses native static bounds");
+        }
+        else WLOG_WARN("M2 hit bounds: unexpected client bytes; sequence bounds guard not installed");
         HookAttachByName("M2.SceneTriangleHitTest", &hkSceneTriangleHitTest, &g_origSceneTriangleHitTest);
         HookAttachByName("M2.SortOpaqueGeoBatches", &hkSortOpaqueGeoBatches, &g_origSortOpaqueGeoBatches);
         return true;

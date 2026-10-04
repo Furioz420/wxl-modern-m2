@@ -32,6 +32,8 @@
 #include "RibbonShader.hpp"
 #include "ShaderObjects.hpp"
 #include "ShadowSpace.hpp"
+#include "ShadowReceiverCapture.hpp"
+#include "TerrainShadows.hpp"
 
 #include "common/Mem.hpp"
 #include "engine/events/Event.hpp"
@@ -78,6 +80,12 @@ namespace
 
     // --- the DIP vtable slot itself ---------------------------------------------------------------
     WXL_M2Draw_DIPFn       g_origDIP      = nullptr;
+    long __stdcall DrawNativeWithShadows(void* dev,int pt,int bv,unsigned mi,unsigned nv,unsigned si,unsigned pc)
+    {
+        // Most indexed calls in dense scenes are caster work. Avoid receiver lookup on that path.
+        if(wxl::runtime::m2shadow::HasShadowContext()) return g_origDIP(dev,pt,bv,mi,nv,si,pc);
+        return wxl::modern::terrainshadow::Draw(dev,pt,bv,mi,nv,si,pc,g_origDIP);
+    }
     WXL_M2Draw_InterceptFn g_oneShot      = nullptr; // armed by wxl.m2draw's SetOneShotIntercept
     void EnsureDIPHook(IDirect3DDevice9* dev);   // defined after the detours
 
@@ -681,7 +689,7 @@ namespace
         }
         dev->SetTextureStageState(3, D3DTSS_COLOROP, D3DTOP_DISABLE);
 
-        long r = g_origDIP(dev, pt, bv, mi, nv, si, pc);
+        long r = DrawNativeWithShadows(dev, pt, bv, mi, nv, si, pc);
 
         for (DWORD st = 0; st < 4; ++st)
         {
@@ -791,6 +799,8 @@ namespace
      */
     long __stdcall hkDIP(void* dev, int pt, int bv, unsigned mi, unsigned nv, unsigned si, unsigned pc)
     {
+        wxl::modern::shadowcapture::Observe(dev,(g_oneShot ? 1u : 0u) | (g_ribbonModern ? 2u : 0u) |
+            (g_curModel ? 4u : 0u) | (wxl::runtime::m2shadow::HasShadowContext() ? 8u : 0u),nv,pc);
         si = wxl::runtime::m2shadow::PrepareDIP(dev,pt,si,pc);
         wxl::runtime::m2shadow::BeforeDIP(dev, si, pc);
         TraceDraw(dev,_ReturnAddress(),1,pt,nv,pc,1);
@@ -799,23 +809,23 @@ namespace
         if (WXL_M2Draw_InterceptFn intercept = g_oneShot)
         {
             g_oneShot = nullptr;
-            return intercept(dev, pt, bv, mi, nv, si, pc, g_origDIP);
+            return intercept(dev, pt, bv, mi, nv, si, pc, DrawNativeWithShadows);
         }
         if (g_ribbonModern)
             return DrawRibbonMultiTexture(static_cast<IDirect3DDevice9*>(dev), pt, bv, mi, nv, si, pc);
 
         if(wxl::modern::ribbon::Active())
-            return wxl::modern::ribbon::Draw(dev,pt,bv,mi,nv,si,pc,g_origDIP);
+            return wxl::modern::ribbon::Draw(dev,pt,bv,mi,nv,si,pc,DrawNativeWithShadows);
 
         wxl::modern::particlediag::BeforeDIP(dev, si, pc);
         if (wxl::modern::particlelayers::Active())
-            return wxl::modern::particlelayers::DrawDIP(dev, pt, bv, mi, nv, si, pc, g_origDIP);
+            return wxl::modern::particlelayers::DrawDIP(dev, pt, bv, mi, nv, si, pc, DrawNativeWithShadows);
         const unsigned drawStartIndex = wxl::runtime::m2shadow::HasShadowContext()
             ? si : ExpandM2StartIndex(si);
         ProbeFemaleOrcD3DGeometry(dev, bv, mi, nv, drawStartIndex, pc);
         wxl::modern::materialdiag::BeforeDraw(dev, g_curDrawCtx, g_curModel, drawStartIndex, pc);
         long r = wxl::modern::materialblend::Draw(dev, g_curDrawCtx, g_curModel,
-            pt, bv, mi, nv, drawStartIndex, pc, g_origDIP);
+            pt, bv, mi, nv, drawStartIndex, pc, DrawNativeWithShadows);
 
         // One bounded proof that the Retail Orc-female base model reaches D3D after visibility,
         // optimized-list construction, material setup and bone-palette upload. g_curModel is the
@@ -912,6 +922,8 @@ namespace wxl_modern_m2
 {
     bool InstallM2Draw()
     {
+        wxl::modern::shadowcapture::Install();
+        wxl::modern::terrainshadow::Install();
         wxl::modern::shaderobjects::Initialize();
         wxl::modern::materialdiag::Initialize();
         wxl::modern::materialblend::Initialize();

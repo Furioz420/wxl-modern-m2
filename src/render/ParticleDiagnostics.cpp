@@ -10,6 +10,7 @@
 #include "offsets/game/M2.hpp"
 #include <d3d9.h>
 #include <cstdio>
+#include <intrin.h>
 
 namespace wxl::modern::particlediag
 {
@@ -25,6 +26,37 @@ namespace wxl::modern::particlediag
         ShaderSet shaders;
         DrawFn originalDraw = nullptr;
         unsigned entryReports = 0;
+        bool timeline = false;
+        struct TimelineSlot { void* instance=nullptr; void* emitter=nullptr; uint32_t first=0,last=0,count=0; };
+        std::array<TimelineSlot,32> timelineSlots{};
+        unsigned timelineReports=0;
+        off::M2_SetBoneSequenceFn originalSequence=nullptr;
+        unsigned sequenceReports=0;
+        bool SequenceTarget(void* raw) noexcept
+        {
+            __try {
+                const auto* instance=static_cast<const off::M2Instance*>(raw);
+                if(!instance || !instance->model)return false;
+                wxl::game::m2::M2Model model(reinterpret_cast<void*>(instance->model));
+                const char* path=model.GetPathStem();
+                if(!path)return false;
+                char bounded[276]{};
+                unsigned n=0;
+                for(;n+1<sizeof(bounded) && path[n];++n)bounded[n]=path[n];
+                return !path[n] && diag::MatchesPath(bounded,"cfx_deathknight_deathanddecay_state.m2");
+            } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+        }
+        void __fastcall SequenceTrace(void* instance,void* edx,uint32_t slot,uint32_t id,
+            uint32_t previous,uint32_t variation,float blend,uint32_t loop,uint32_t primary)
+        {
+            const void* caller=_ReturnAddress();
+            if(timeline && sequenceReports<64 && SequenceTarget(instance)) {
+                ++sequenceReports;
+                WLOG_INFO("m2-dnd-sequence-request: instance=%p caller=%p tick=%u slot=%u id=%u previous=%u variation=%u blend=%g loop=%u primary=%u; forwarded unchanged",
+                    instance,caller,GetTickCount(),slot,id,previous,variation,blend,loop,primary);
+            }
+            originalSequence(instance,edx,slot,id,previous,variation,blend,loop,primary);
+        }
         struct Context
         {
             void* shared = nullptr;
@@ -40,6 +72,38 @@ namespace wxl::modern::particlediag
             char path[276]{};
         };
         Context* active = nullptr; // scoped to the render-thread's native DrawParticle call
+        // Draw-entry observations only: absence is not proof of an expired emitter.
+        // No retained resource references or animation requests. Root bone is a timing clue,
+        // not proof that every particle track evaluates that same sequence.
+        void Timeline(const Context& ctx) noexcept
+        {
+            if(!timeline || timelineReports>=256 || !ctx.recordValid)return;
+            const uint32_t now=GetTickCount();
+            TimelineSlot* slot=nullptr;
+            for(auto& s:timelineSlots) {
+                if(s.instance==ctx.instance && s.emitter==ctx.emitter){slot=&s;break;}
+                if(!s.instance && !slot)slot=&s;
+            }
+            if(!slot || (slot->count && (slot->count>=24 || uint32_t(now-slot->last)<1000)))return;
+            if(!slot->count){slot->instance=ctx.instance;slot->emitter=ctx.emitter;slot->first=now;}
+            slot->last=now;++slot->count;++timelineReports;
+            bool valid=false;
+            uint32_t time=0,pending=UINT32_MAX,duration=0,flags=0;
+            uint16_t index=UINT16_MAX,assigned=UINT16_MAX,id=UINT16_MAX;
+            __try {
+                const auto* instance=static_cast<const off::M2Instance*>(ctx.instance);
+                if(ctx.owner->bones.count && instance->boneStates) {
+                    const auto* bone=reinterpret_cast<const off::RuntimeBone*>(instance->boneStates);
+                    time=bone->time;index=bone->animIndex;assigned=bone->assignedSeq;pending=bone->pendingSeq;
+                    if(ctx.owner->sequences.offset && ctx.owner->sequences.count<=65536 && index<ctx.owner->sequences.count) {
+                        const auto& seq=reinterpret_cast<const fmt::M2Sequence*>(ctx.owner->sequences.offset)[index];
+                        id=seq.id;duration=seq.duration;flags=seq.flags;valid=true;
+                    }
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER){valid=false;}
+            WLOG_INFO("m2-particle-timeline: path='%s' instance=%p emitter=%u elapsed=%u live=%u alpha=%g rootValid=%u index=%u assigned=%u pending=%u time=%u sequenceId=%u duration=%u flags=%#x; draw-entry observation only",
+                ctx.path,ctx.instance,ctx.index,now-slot->first,ctx.live,ctx.alpha,unsigned(valid),unsigned(index),unsigned(assigned),pending,time,unsigned(id),duration,flags);
+        }
         template<class T> T Read(const void* p, size_t at) noexcept
         {
             T value;
@@ -158,6 +222,11 @@ namespace wxl::modern::particlediag
         {
             const bool layers = particlelayers::Initialize();
             enabled = wxl_modern_m2::ConfigBool("WXL_M2_PARTICLE_PROBE", false);
+            timeline = enabled && wxl_modern_m2::ConfigBool("WXL_M2_PARTICLE_TIMELINE", false);
+            timelineSlots={};timelineReports=0;
+            sequenceReports=0;
+            if(timeline && !originalSequence && !wxl_modern_m2::HookAttachByName("M2.SetBoneSequence",&SequenceTrace,&originalSequence))
+                WLOG_WARN("m2-dnd-sequence-request: hook unavailable; particle timeline remains enabled");
             if (!enabled && !layers) return;
             filter[0] = 0;
             wxl_modern_m2::ConfigRaw("WXL_M2_PARTICLE_PROBE_PATH", filter, sizeof(filter));
@@ -180,7 +249,7 @@ namespace wxl::modern::particlediag
     uint32_t Draw(DrawFn original, void* raw, void* edx, uint32_t first,
                   void* elements, const uint32_t* order, uint32_t end)
     {
-        if (!enabled || reading || budget.Exhausted()) return original(raw, edx, first, elements, order, end);
+        if (!enabled || reading || (budget.Exhausted() && (!timeline || timelineReports>=256))) return original(raw, edx, first, elements, order, end);
         Context ctx{};
         Context* previous = active;
         active = nullptr; // nested nonmatching draws cannot inherit an outer attribution
@@ -188,6 +257,7 @@ namespace wxl::modern::particlediag
         if (ReadContext(raw, ctx) && diag::MatchesPath(ctx.path, filter) &&
             (includeNative || assets::m2::IsNativeLoaded(ctx.shared)))
         {
+            Timeline(ctx);
             ctx.isolated = isolate && elements && order && first < end && end <= 0x10000;
             active = &ctx;
             if (entryReports < 12)

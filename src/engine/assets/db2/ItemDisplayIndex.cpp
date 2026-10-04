@@ -2,6 +2,7 @@
 // Copyright (C) 2026 WarcraftXL. GPLv3.
 
 #include "ItemDisplayIndex.hpp"
+#include "HelmetRuleSnapshot.hpp"
 
 #include "client/CharModel/RetailSkinProvider.hpp"
 #include "ExtensionApi.hpp"
@@ -202,6 +203,33 @@ namespace wxl::runtime::db2::itemdisplay
     {
         const std::lock_guard lock(g_mutex);
         return g_generation;
+    }
+
+    std::shared_ptr<const std::vector<HelmetGeosetRule>> HelmetRules(uint32_t visibilityId)
+    {
+        if (!visibilityId) return {};
+        const std::lock_guard lock(g_mutex);
+        const auto* api = wxl_modern_m2::RetailDb2();
+        if (!api || !api->Enabled || !api->Enabled()) return {};
+        static uint64_t cachedGeneration = 0;
+        static std::unordered_map<uint32_t,
+            std::shared_ptr<const std::vector<HelmetGeosetRule>>> cache;
+        const auto generation = api->IndexGeneration();
+        if (cachedGeneration != generation) {
+            cache.clear();
+            cachedGeneration = generation;
+        }
+        if (const auto found = cache.find(visibilityId); found != cache.end()) return found->second;
+        void* lease = api->AcquireIndex();
+        if (!lease) return {};
+        struct Release {
+            const WXL_RetailDb2Api* api;
+            void* lease;
+            ~Release() { api->ReleaseIndex(lease); }
+        } release{api, lease};
+        auto rules = ReadHelmetRules(*api, lease, visibilityId);
+        if (rules) cache.emplace(visibilityId, rules);
+        return rules;
     }
 
     void Request(uint32_t displayId)
