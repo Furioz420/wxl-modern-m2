@@ -1,20 +1,20 @@
-# Builds wxl-modern-m2.dll against wxl-core's build shell and publishes it as a GitHub Release on
-# every push to main/master. wxl-core is checked out fresh each run (branch v1.1) and this extension's
-# own source is copied into its extensions/wxl-modern-m2/ folder, where wxl-core's root CMakeLists.txt
-# auto-discovers it as a build target -- no CMakeLists.txt of our own needed.
+# Build against the pinned compatible core; publish only on an explicit version tag.
 name: Build and Release
 
 on:
+  pull_request:
+    branches: [main]
   push:
-    branches: [main, master]
+    branches: [main]
+    tags: ['v*']
 
 permissions:
   contents: write   # needed to publish a Release
 
 env:
   EXT_NAME: wxl-modern-m2
-  CORE_REPO: WarcraftXL/wxl-core
-  CORE_REF: v1.1
+  CORE_REPO: Furioz420/wxl-core
+  CORE_REF: 48b2849ed05d2c66e2ba2a6185e09fafd111da53
 
 jobs:
   build:
@@ -62,7 +62,17 @@ jobs:
           if (-not $v) { throw "wxl.json carries no extension.version" }
           "version=$v" >> $env:GITHUB_OUTPUT
 
+      - name: Verify release tag matches manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $expected = "v${{ steps.v.outputs.version }}"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match manifest $expected"
+          }
+
       - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.v.outputs.version }}
