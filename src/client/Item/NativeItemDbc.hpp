@@ -22,6 +22,9 @@ namespace wxl::client::nativeitemdbc
     // Reads the original DBC male/female HelmetGeosetVis fields, including zero.
     bool SupplementalHelmetVisibility(uint32_t displayId, uint32_t sex, uint32_t& visibility) noexcept;
 
+    /** True only for a verified display row with both model names empty. */
+    bool SupplementalDisplayHasNoModel(uint32_t displayId) noexcept;
+
     /** Returns whether the complete host ItemDisplayInfo.dbc contains a row. */
     bool SupplementalDisplayExists(uint32_t displayId) noexcept;
 

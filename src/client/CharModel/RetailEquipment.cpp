@@ -14,6 +14,7 @@
 #include "engine/assets/db2/ItemDisplayIndex.hpp"
 #include "wxl/EventScript.hpp"
 #include "game/Binding.hpp"
+#include "game/Io.hpp"
 #include "game/M2.hpp"
 #include "game/World.hpp"
 #include "game/Unit.hpp"
@@ -662,7 +663,12 @@ namespace
     {
         // The client-owned row layout is not the on-disk 25-DWORD layout.
         // Read verified file fields rather than interpreting runtime string data as IDs.
-        return wxl::client::nativeitemdbc::SupplementalHelmetVisibility(displayId, sex, visibility);
+        if (!wxl::client::nativeitemdbc::SupplementalHelmetVisibility(displayId, sex, visibility))
+            return false;
+        // Some NPC outfits use a model-less head display (e.g. 15676) carrying
+        // an old helmet visibility ID. No helmet geometry covers these ears/hair.
+        if (wxl::client::nativeitemdbc::SupplementalDisplayHasNoModel(displayId)) visibility = 0;
+        return true;
     }
 
     bool HelmetActorIdentity(void* cmo, void* instance, uint32_t& race, uint32_t& sex) noexcept
@@ -781,6 +787,7 @@ namespace
         uint32_t capeGeoset = 0;
         const std::vector<itemdisplay::HelmetGeosetRule>* helmetRules =
             nullptr;
+        std::shared_ptr<const std::vector<itemdisplay::HelmetGeosetRule>> helmetRuleOwner;
         uint32_t helmetVisId = 0;
         uint32_t modelRace = 0;
         uint32_t gender = 0;
@@ -793,11 +800,8 @@ namespace
             else if (const auto display = index->displayRecords.find(headDisplayId);
                      display != index->displayRecords.end())
                 helmetVisId = display->second.helmetVis[gender == 1 ? 1u : 0u];
-            if (helmetVisId && index->helmetData)
-            {
-                const auto rules = index->helmetData->geosetsByVis.find(helmetVisId);
-                if (rules != index->helmetData->geosetsByVis.end()) helmetRules = &rules->second;
-            }
+            helmetRuleOwner = itemdisplay::HelmetRules(helmetVisId);
+            if (helmetRuleOwner && !helmetRuleOwner->empty()) helmetRules = helmetRuleOwner.get();
         }
         // Log once per owner/head/visibility combination rather than spending the entire
         // diagnostic budget on the login character before NPCs load.
@@ -1348,15 +1352,17 @@ namespace
         if(alias.empty()||alias.size()>=sizeof(output))return false;
         // Only route files delivered by the unmodified Retail helmet pack. Missing
         // and private/custom helmet names retain their existing asset resolution.
-        static const std::string directory=[] {
-            char exe[MAX_PATH]{};GetModuleFileNameA(nullptr,exe,MAX_PATH);
-            std::string path=exe;return path.substr(0,path.find_last_of("\\/"))+"\\Data\\Patch-Z.MPQ\\";
-        }();
         static thread_local std::unordered_map<std::string,bool> available;
         auto found=available.find(alias);
         if(found==available.end()) {
-            DWORD attr=GetFileAttributesA((directory+alias).c_str());
-            found=available.emplace(alias,attr!=INVALID_FILE_ATTRIBUTES && !(attr&FILE_ATTRIBUTE_DIRECTORY)).first;
+            // The accepted original meshes may live in packed shards, not a loose
+            // Patch-Z directory. Ask the same mounted namespace as the model loader.
+            void* handle = nullptr;
+            const bool opened = wxl::game::io::FileOpen(alias.c_str(), 0, &handle) != 0;
+            const bool exists = opened && handle;
+            if (handle) wxl::game::io::FileClose(handle);
+            found=available.emplace(alias,exists).first;
+            WLOG_INFO("retail-helmet-route-v2: available=%u path='%s'", exists, alias.c_str());
         }
         if(!found->second)return false;
         std::memcpy(output,alias.c_str(),alias.size()+1);

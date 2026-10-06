@@ -137,6 +137,7 @@ namespace wxl::runtime::m2native::detail
                       const wxl::structure::m2::M2Sequence* sequences, uint32_t sequenceCount);
 
     bool SpliceSkeleton(void* model, wxl::structure::m2::M2Header* h, Outcome& out);
+    bool PadEventSlots(void* model, wxl::structure::m2::M2Header* h);
 
     // Skin profiles still arrive through the stock sibling loader and are reshaped later, on the live
     // parsed profile. Owning that parse plugs in here as its own record map plus normalizer table over

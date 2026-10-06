@@ -5,6 +5,7 @@
 #include "SourceMaterial.hpp"
 #include "SourceParticle.hpp"
 #include "SourceRibbon.hpp"
+#include "MeshTxac.hpp"
 #include "engine/assets/shared/models/m2/M2Format.hpp"
 
 #include <memory>
@@ -26,6 +27,8 @@ namespace wxl::modern::assets::m2::material
         uint32_t globalFlags = 0;
         uint32_t skippedChunks = UINT32_MAX; // unknown unless supplied by the bounded container scanner
         std::vector<SourceRenderFlags> materials;
+        MeshTxacState meshTxacState = MeshTxacState::Unknown;
+        std::vector<std::array<uint8_t,2>> meshTxac;
         // filename offsets below are ORIGINAL file offsets, never live pointers.
         std::vector<wxl::structure::m2::M2Texture> textures;
         std::vector<uint32_t> textureFileDataIds;
@@ -38,7 +41,10 @@ namespace wxl::modern::assets::m2::material
         std::vector<SourceRibbon> ribbons;
         std::vector<SourceParticle> particles;
         bool particleLayerFeaturesKnown = false;
+        std::vector<uint8_t> nativeSpriteLayers; // Per-emitter neutral metadata, not full source support.
+        std::vector<uint8_t> spriteLayerKinds; // 0 unsupported, 1 neutral, 2 TXAC 1/1 approximation; no 32-emitter cap.
         uint32_t riftNativeSpriteMask = 0; // exact-source approximation, never features-known
+        uint32_t txac11SpriteMask = 0; // captured metadata only; does NOT admit the UV shader
         std::vector<std::array<float,2>> particleMultipliers; // EXP2 RGB/alpha; owned, validated subset
         size_t StorageBytes() const noexcept;
     };

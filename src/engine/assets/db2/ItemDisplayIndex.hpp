@@ -107,6 +107,9 @@ namespace wxl::runtime::db2::itemdisplay
     /** Returns the current snapshot, or null while the DB2 background index is still building. */
     std::shared_ptr<const Index> Current();
 
+    /** Native DBC visibility IDs need not belong to a resolved Retail display. */
+    std::shared_ptr<const std::vector<HelmetGeosetRule>> HelmetRules(uint32_t visibilityId);
+
     /** Queues an unresolved display for the background item graph worker. */
     void Request(uint32_t displayId);
 

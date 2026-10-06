@@ -18,6 +18,7 @@
 #include "../ExtensionApi.hpp"
 #include "ShadowSpace.hpp"
 #include "ShadowBatchLimit.hpp"
+#include "LampLightPolicy.hpp"
 #include "../compat/BoneBudget.hpp"
 #include "../compat/ModernM2.hpp"
 
@@ -502,10 +503,57 @@ namespace
      *
      * Calling convention: fastcall, ecx = renderCtx, 5 stack args, ret 0x14 (callee-cleanup).
      */
+    bool ApplyLampFalloff(void* instance) noexcept
+    {
+        // CM2Model::AnimateMT owns these per-instance light writes. The native
+        // light is embedded at +0x68 in its 0xd4 animated-light record. No node
+        // pointers survive the call and no scene-list traversal is involved.
+        __try {
+            auto* inst = static_cast<unsigned char*>(instance);
+            if (!inst) return false;
+            auto* shared = *reinterpret_cast<unsigned char**>(inst + m2::kOffInstModel);
+            if (!shared) return false;
+            const auto* profile = wxl_modern_m2::lamplight::FindProfile(
+                reinterpret_cast<const char*>(shared + m2::kOffModelPathStem));
+            if (!profile) return false;
+            auto* h = *reinterpret_cast<unsigned char**>(shared + m2::kOffModelHeader);
+            if (!h || profile->count==0 || profile->count>64 ||
+                *reinterpret_cast<uint32_t*>(h+0x108)!=profile->count ||
+                *reinterpret_cast<uint32_t*>(h+0x2c)!=profile->bones ||
+                *reinterpret_cast<uint32_t*>(h+0x3c)!=profile->vertices) return false;
+            auto* record = *reinterpret_cast<unsigned char**>(h+0x10c);
+            if (!record) return false;
+            using namespace wxl_modern_m2::lamplight;
+            auto* animated = *reinterpret_cast<unsigned char**>(inst+0x1d0);
+            if (!animated) return false;
+            // Validate the whole reviewed light array before making any change.
+            for (unsigned i=0;i<profile->count;++i) {
+                const auto* r=record+i*0x9c;
+                const auto& e=profile->emitters[i];
+                const auto* position=reinterpret_cast<const float*>(r+4);
+                if (*reinterpret_cast<const uint16_t*>(r)!=1 ||
+                    *reinterpret_cast<const uint16_t*>(r+2)!=e.bone ||
+                    !Near(position[0],e.position[0]) || !Near(position[1],e.position[1]) ||
+                    !Near(position[2],e.position[2]) ||
+                    *reinterpret_cast<uint32_t*>(animated+i*0xd4+0x68+8)!=1 ||
+                    !OwnedFalloff(reinterpret_cast<float*>(animated+i*0xd4+0x68+0x54))) return false;
+            }
+            for (unsigned i=0;i<profile->count;++i)
+                SetFalloff(reinterpret_cast<float*>(animated+i*0xd4+0x68+0x54));
+            return true;
+        } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
     void __fastcall hkBuildBonePalette(void* renderCtx, void* edx,
         void* sa1, void* sa2, void* sa3, uint32_t sa4, uint32_t sa5)
     {
         g_origBuildBonePalette(renderCtx, edx, sa1, sa2, sa3, sa4, sa5);
+        if (ApplyLampFalloff(renderCtx)) {
+            static std::atomic<unsigned> reports{0};
+            if (reports.load(std::memory_order_relaxed) < 3 &&
+                reports.fetch_add(1, std::memory_order_relaxed) < 3)
+                WLOG_INFO("lamp-falloff: catalog-reviewed emitter attenuation=(1,0.10,0.005)");
+        }
         ev::BuildBonePaletteArgs a{ renderCtx };
         wxl_modern_m2::g_api->Emit(uint32_t(ev::Event::OnBuildBonePalette), &a);
         ProbeFemaleOrcBonePalette(renderCtx);

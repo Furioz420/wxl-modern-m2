@@ -37,9 +37,9 @@ namespace wxl::modern::assets::m2::material
 
     size_t ModelSource::StorageBytes() const noexcept
     {
-        return sizeof(*this) + Bytes(materials) + Bytes(textures) + Bytes(textureFileDataIds) +
+        return sizeof(*this) + Bytes(materials) + Bytes(meshTxac) + Bytes(textures) + Bytes(textureFileDataIds) +
             Bytes(textureCombos) + Bytes(coordCombos) + Bytes(weightCombos) +
-            Bytes(transformCombos) + Bytes(combinerCombos) + Bytes(particles) + Bytes(particleMultipliers) + Bytes(ribbons);
+            Bytes(transformCombos) + Bytes(combinerCombos) + Bytes(particles) + Bytes(particleMultipliers) + Bytes(nativeSpriteLayers) + Bytes(spriteLayerKinds) + Bytes(ribbons);
     }
 
     size_t SkinSource::StorageBytes() const noexcept
@@ -92,6 +92,13 @@ namespace wxl::modern::assets::m2::material
                  !CopyRaw(base, size, header.textureCombinerCombos, source->combinerCombos)))
                 return false;
             if (txidCount) source->textureFileDataIds.assign(txids, txids + txidCount);
+            try {
+                source->meshTxacState=ReadMeshTxac(container,containerSize,
+                    header.materials.count,header.particleEmitters.count,source->meshTxac);
+            } catch(...) {
+                std::vector<std::array<uint8_t,2>>().swap(source->meshTxac);
+                source->meshTxacState=MeshTxacState::Unknown;
+            }
             source->sourceRibbonCount=header.ribbonEmitters.count;
             source->sourceTransformCount=header.textureTransforms.count;
             if(header.version>=272 && header.version<=274 && header.ribbonEmitters.count<=128) {
@@ -139,13 +146,17 @@ namespace wxl::modern::assets::m2::material
             }
             if (source->particleCapture == ParticleCapture::Captured)
                 source->particleLayerFeaturesKnown = CaptureLayerFeatures(base,size,container,containerSize,*source);
-            source->riftNativeSpriteMask = CaptureRiftNativeSpriteContract(container,containerSize,*source);
+            CaptureNativeSpriteLayers(base,size,container,containerSize,*source);
+              source->riftNativeSpriteMask = CaptureRiftNativeSpriteContract(container,containerSize,*source);
             if (source->particleCapture == ParticleCapture::Captured && source->StorageBytes() > limits_.bytes - bytes_)
             {
                 std::vector<SourceParticle>().swap(source->particles);
                 std::vector<std::array<float,2>>().swap(source->particleMultipliers);
                 source->particleLayerFeaturesKnown = false;
+                  source->nativeSpriteLayers.clear();
+                source->spriteLayerKinds.clear();
                 source->riftNativeSpriteMask = 0;
+                source->txac11SpriteMask = 0;
                 source->particleCapture = ParticleCapture::OverBudget;
             }
             const size_t bytes = source->StorageBytes();

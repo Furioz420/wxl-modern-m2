@@ -7,6 +7,8 @@
 #include "ParticleMaterialState.hpp"
 #include "ParticleNativeShaderPolicy.hpp"
 #include "ParticleViewPolicy.hpp"
+#include "RefractionAttributionPolicy.hpp"
+#include "ParticleRefraction.hpp"
 #include "ParticleDiagnosticPolicy.hpp"
 #include "TexturePayloadAudit.hpp"
 #include "MaterialDiagnosticPolicy.hpp"
@@ -29,6 +31,11 @@ namespace {
     bool modulationEnabled=false;
     bool textureAuditEnabled=false;
     bool riftNativeSpritesEnabled=false;
+    bool omitBloodRefraction=false;
+    bool bloodRefractionEnabled=false;
+    bool bloodSmokeEnabled=false;
+    bool bloodPlagueEnabled=false;
+    bool spriteMaterialsEnabled=false;
     char textureAuditPath[276]{};
     materialdiag::ProbeBudget textureAuditBudget{48,2,500};
     bool viewEnabled=false;
@@ -50,7 +57,13 @@ namespace {
         unsigned nativeKind=0;
         float minAge=3600,maxAge=0;
         bool valid=true;
+        bool nativeSprite=false;
         bool viewTarget=false;
+        bool diagnosticOmit=false;
+        bool bloodRefraction=false;
+        bool bloodSmoke=false;
+        bool bloodPlague=false;
+        bool spriteMaterial=false;
     };
     struct ReportKey {const void* owner=nullptr;unsigned emitter=0,stage=0,count=0;const char* reason=nullptr;};
     std::array<ReportKey,32> appliedReports{},skipReports{};
@@ -67,6 +80,7 @@ namespace {
         }
         return false;
     }
+    bool nativeSpriteEnabled=false;
     Frame* current=nullptr;
     bool RiftTarget(void* raw) noexcept {
         if(!riftdiag::enabled.load() || !raw)return false;
@@ -133,6 +147,25 @@ namespace {
                 Read<uintptr_t>(out.emitter,off::kOffEmitterHeadCellBlock),out.index);
         } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
     }
+    bool RefractionAttributionTarget(const Frame& frame) noexcept {
+        if((!omitBloodRefraction && !bloodRefractionEnabled) || !frame.source)return false;
+        __try {
+            const char* source=wxl::game::m2::M2Model(frame.id.shared).GetPathStem();
+            if(!source)return false;
+            char path[276]{};size_t n=0;
+            for(;n+1<sizeof(path)&&source[n];++n)path[n]=source[n];
+            return !source[n]&&MatchBloodBoilRefraction(true,path,*frame.source,frame.id.index);
+        } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+    bool ExactParticlePath(const Frame& frame,const char* wanted) noexcept {
+        __try {
+            const char* source=wxl::game::m2::M2Model(frame.id.shared).GetPathStem();
+            if(!source)return false;
+            char path[276]{};size_t n=0;
+            for(;n+1<sizeof(path)&&source[n];++n)path[n]=source[n];
+            return !source[n]&&ViewPathMatches(path,wanted);
+        } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
     struct VertexSnapshot {uintptr_t position=0;unsigned stride=0,count=0;float age=0;};
     bool Snapshot(void* particle,void* writer,VertexSnapshot& out) noexcept {
         if(!particle||!writer)return false;
@@ -157,7 +190,7 @@ namespace {
         if(coverage)++coverage->build;
         Frame* frame=current;
         VertexSnapshot before;
-        const bool selected=enabled&&frame&&frame->valid&&frame->id.emitter==emitter;
+        const bool selected=enabled&&frame&&!frame->diagnosticOmit&&!frame->bloodRefraction&&frame->valid&&frame->id.emitter==emitter;
         const bool captured=selected&&Snapshot(particle,writer,before);
         const uint32_t result=originalBuild(emitter,edx,particle,writer);
         if(!selected)return result;
@@ -304,6 +337,14 @@ namespace {
             !out.Check(nativeIb.value->GetDesc(&ibDesc),"index-desc")||!out.Check(nativeVb.value->GetDesc(&vbDesc),"vertex-desc")||
             !out.Gate(ibDesc.Format==D3DFMT_INDEX16,"index-format")||
             !out.Gate(QuadRanges(base,min,frame.vertexCount,start,primitives,offset,stride,vbDesc.Size,ibDesc.Size),"native-buffer-ranges"))return false;
+        if(frame.nativeSprite && frame.source->particles[frame.id.index].Blend()==2) {
+            DWORD on=0,src=0,dst=0,op=0;
+            if(!out.Check(d->GetRenderState(D3DRS_ALPHABLENDENABLE,&on),"alpha-state") ||
+               !out.Check(d->GetRenderState(D3DRS_SRCBLEND,&src),"alpha-src") ||
+               !out.Check(d->GetRenderState(D3DRS_DESTBLEND,&dst),"alpha-dst") ||
+               !out.Check(d->GetRenderState(D3DRS_BLENDOP,&op),"alpha-op") ||
+               !out.Gate(on && src==D3DBLEND_SRCALPHA && dst==D3DBLEND_INVSRCALPHA && op==D3DBLENDOP_ADD,"alpha-native-contract"))return false;
+        }
         // Capture before readiness/upload or any other mutations. Resources are strictly draw-local.
         if(!out.Check(d->CreateStateBlock(D3DSBT_ALL,&out.saved.value),"create-state-block")||!out.Check(out.saved.value->Capture(),"capture-state"))return false;
         out.captured=true;
@@ -345,16 +386,17 @@ namespace {
         if(!out.Check(out.indices.value->Unlock(),"unlock-ib")||!out.Check(d->SetIndices(out.indices.value),"bind-ib"))return false;
         if(!out.Check(d->SetStreamSource(0,out.vertices.value,0,stride+16),"bind-vb")||!out.Check(d->SetVertexDeclaration(out.declaration.value),"bind-declaration")||
             !out.Check(d->SetVertexShader(out.vertex.value),"bind-vs")||!out.Check(d->SetPixelShader(out.pixel.value),"bind-ps"))return false;
-        // Mode 0 retains the preceding experiment. Mode 1 bridges only the accepted blend-7 subset.
+        // BlendAdd uses black fog; new alpha-blend sprites retain native blending and fog.
         // Source animated cutoff is verified zero; 1/255 is this blend family's material alpha test.
         const float modulation=pm::SourceRGBModulationCandidate(modulationEnabled,frame.source->particles[frame.id.index].Flags());
-        const float parameters[4]{frame.recipe.multipliers[0]*modulation,frame.recipe.multipliers[1],materialEnabled?1.0f/255.0f:0.0f,materialEnabled?1.0f:0.0f};
+        const bool blendAdd=frame.source->particles[frame.id.index].Blend()==7;
+        const float parameters[4]{frame.recipe.multipliers[0]*modulation,frame.recipe.multipliers[1],materialEnabled?1.0f/255.0f:0.0f,materialEnabled&&blendAdd?1.0f:0.0f};
         if(!out.Check(d->SetPixelShaderConstantF(0,parameters,1),"bind-constants"))return false;
         if(frame.viewTarget&&frame.id.index==viewEmitter&&viewMode) {
             const float diagnostic[4]{float(viewMode),0,0,0};
             if(!out.Check(d->SetPixelShaderConstantF(1,diagnostic,1),"bind-view-constants"))return false;
         }
-        if(materialEnabled&&!out.Check(ApplyBlendAdd(d,out.textureStage),"blendadd-state"))return false;
+        if(materialEnabled&&blendAdd&&!out.Check(ApplyBlendAdd(d,out.textureStage),"blendadd-state"))return false;
         for(unsigned stage=0;stage<3;++stage){
             out.textureStage=stage;
             if(!out.Check(d->SetTexture(stage,out.textures[stage].value),"bind-texture"))return false;
@@ -375,6 +417,17 @@ bool Initialize() noexcept {
             unsigned(materialconfig::Feature("WXL_M2_BLEND7_SOURCE_LIGHTING")),materialconfig::RibbonMode());
         textureAuditPath[0]=0;
         textureAuditEnabled=materialEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_PARTICLE_TEXTURE_AUDIT",false);
+        nativeSpriteEnabled=materialEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_NATIVE_SPRITE_LAYERS",false);
+        bloodSmokeEnabled=materialEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_BLOOD_SMOKE_APPROX",false);
+        bloodPlagueEnabled=materialEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_BLOOD_PLAGUE_APPROX",false);
+        spriteMaterialsEnabled=materialEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_SPRITE_MATERIALS",false);
+        if(spriteMaterialsEnabled)WLOG_WARN("m2-sprite-materials: metadata-selected blend2/7 layers enabled; neutral and TXAC1/1 only; UV approximation, not universal shader support");
+        if(bloodPlagueEnabled)WLOG_WARN("m2-blood-plague: exact target emitter1 colour composition enabled; TXAC UV approximation, NOT retail parity");
+        if(bloodSmokeEnabled)WLOG_WARN("m2-blood-smoke: exact emitters1/2/5/6 colour composition enabled; 2/5 neutral metadata, 1/6 TXAC UV approximation; NOT retail parity");
+        omitBloodRefraction=enabled&&wxl_modern_m2::ConfigBool("WXL_M2_BLOOD_REFRACTION_OMIT",false);
+        bloodRefractionEnabled=enabled&&!omitBloodRefraction&&wxl_modern_m2::ConfigBool("WXL_M2_BLOOD_REFRACTION",false);
+        if(bloodRefractionEnabled)WLOG_WARN("m2-blood-refraction: enabled exact Blood Boil emitter0 height-gradient approximation; max4px; NOT retail parity");
+        if(omitBloodRefraction)WLOG_WARN("m2-refraction-attribution: diagnostic enabled; only exact Blood Boil emitter0 distortion map omitted; NOT a visual fix");
         riftNativeSpritesEnabled=materialEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_RIFT_NATIVE_SPRITES",false);
         if(textureAuditEnabled) {
             wxl_modern_m2::ConfigRaw("WXL_M2_PARTICLE_PROBE_PATH",textureAuditPath,sizeof(textureAuditPath));
@@ -398,6 +451,7 @@ bool Initialize() noexcept {
         traceEnabled=viewEnabled&&wxl_modern_m2::ConfigBool("WXL_M2_PARTICLE_DRAW_TRACE",false);
         if(viewEnabled)WLOG_WARN("m2-particle-coverage: enabled hideAll=%u; one row per exact-path batch, including early bypasses; no sample budget",unsigned(hideAllEnabled));
         if(enabled&&!originalBuild&&!wxl_modern_m2::HookAttachByName("M2.ParticleBuildVertex",&Build,&originalBuild))enabled=false;
+        if(nativeSpriteEnabled)WLOG_INFO("m2-native-sprite-layers: neutral TXAC emitters enabled; native simulation retained; alpha blending preserved; nonzero TXAC/refraction remain native");
         if(enabled)WLOG_WARN("m2-particle-layers: experimental layer/UV adapter enabled; material=%u (1=unlit BlendAdd black-fog material-alpha-test); deterministic slot seeds, validated EXP2 subset; not donor parity",unsigned(materialEnabled));
     }catch(...){enabled=false;}
     return enabled;
@@ -425,10 +479,24 @@ uint32_t AroundDraw(particlediag::DrawFn original,void* context,void* edx,uint32
                 if(assets::m2::IsNativeLoaded(frame.id.shared)) {
                     reason="source-missing";
                     frame.source=mat::SourceMaterials().FindModel(frame.id.owner);
-                    if(frame.source) {
+                    const bool refractionTarget=RefractionAttributionTarget(frame);
+                    frame.diagnosticOmit=omitBloodRefraction&&refractionTarget;
+                    frame.bloodRefraction=bloodRefractionEnabled&&refractionTarget;
+                    if(frame.diagnosticOmit || frame.bloodRefraction) {
+                        current=&frame;reason=frame.diagnosticOmit?"diagnostic-refraction-omission":"blood-refraction";
+                    } else if(frame.source) {
                         reason="source-decode";
                         const bool nativeSprites=DecodeRiftNativeSprites(riftNativeSpritesEnabled,RiftTarget(context),*frame.source,frame.id.index,frame.recipe);
-                        if(nativeSprites || Decode(*frame.source,frame.id.index,frame.recipe)) {
+                        frame.nativeSprite=DecodeNativeSprites(nativeSpriteEnabled,*frame.source,frame.id.index,frame.recipe);
+                        frame.bloodSmoke=DecodeBloodSmokeApprox(bloodSmokeEnabled,bloodSmokeEnabled&&ExactParticlePath(frame,"spells\\cfx_deathknight_bloodboil_castworld.m2"),*frame.source,frame.id.index,frame.recipe);
+                        frame.bloodPlague=DecodeBloodPlagueApprox(bloodPlagueEnabled,bloodPlagueEnabled&&ExactParticlePath(frame,"spells\\cfx_deathknight_bloodplague_statechest.m2"),*frame.source,frame.id.index,frame.recipe);
+                        frame.nativeSprite=frame.nativeSprite||frame.bloodSmoke||frame.bloodPlague;
+                        // Preserve the accepted exact-source paths when enabled.
+                        if(!nativeSprites && !frame.nativeSprite) {
+                            frame.spriteMaterial=DecodeSpriteMaterials(spriteMaterialsEnabled,*frame.source,frame.id.index,frame.recipe);
+                            frame.nativeSprite=frame.spriteMaterial;
+                        }
+                        if(nativeSprites || frame.nativeSprite || Decode(*frame.source,frame.id.index,frame.recipe)) {
                             frame.viewTarget=IsViewTarget(frame);current=&frame;
                             reason=nativeSprites?"rift-native-sprites":frame.viewTarget?"ready":"view-target";
                         }
@@ -462,6 +530,14 @@ long DrawDIP(void* device,int type,int base,unsigned min,unsigned vertices,unsig
     if(!enabled||!current)return original(device,type,base,min,vertices,start,primitives);
     auto& frame=*current;
     if(coverage)++coverage->adapter;
+    if(frame.bloodRefraction)return DrawBloodRefraction(device,type,base,min,vertices,start,primitives,original);
+    // Native batch construction/simulation already ran. This diagnostic touches
+    // no GPU state and does not enter layer preparation with an absent recipe.
+    if(frame.diagnosticOmit) {
+        if(Report(viewReports,frame,"refraction-omitted",0))
+            WLOG_WARN("m2-refraction-attribution: omitted owner=%p emitter=%u vertices=%u primitives=%u; diagnostic only",frame.id.shared,frame.id.index,vertices,primitives);
+        return D3D_OK;
+    }
     // Diagnostic omission only: exact particle-only modern target and all source emitters
     // decoded above. No D3D calls/state changes, regardless of texture/shader readiness.
     // Native batch builder still executes once. Stock/non-target/invalid owners cannot enter.
@@ -496,8 +572,10 @@ long DrawDIP(void* device,int type,int base,unsigned min,unsigned vertices,unsig
     const bool restored=prepared.Restore();
     if(frame.viewTarget&&Report(viewReports,frame,"selected",frame.nativeKind))WLOG_INFO("m2-particle-view: selected owner=%p emitter=%u mode=%u vertices=%u restored=%u hr=%#lx",frame.id.shared,frame.id.index,viewMode,vertices,unsigned(restored),result);
     if(Report(appliedReports,frame,"applied",frame.nativeKind)) {
+        if(frame.bloodPlague)WLOG_INFO("m2-blood-plague: applied=1 owner=%p emitter=%u restored=%u hr=%#lx",frame.id.shared,frame.id.index,unsigned(restored),result);
+        if(frame.spriteMaterial)WLOG_INFO("m2-sprite-materials: applied=1 owner=%p emitter=%u metadata=%u blend=%u textures=%u,%u,%u restored=%u hr=%#lx",frame.id.shared,frame.id.index,unsigned(frame.source->spriteLayerKinds[frame.id.index]),unsigned(frame.source->particles[frame.id.index].Blend()),frame.recipe.indices[0],frame.recipe.indices[1],frame.recipe.indices[2],unsigned(restored),result);
         const float modulation=pm::SourceRGBModulationCandidate(modulationEnabled,frame.source->particles[frame.id.index].Flags());
-        WLOG_INFO("m2-particle-layers: applied=1 owner=%p emitter=%u vertices=%u stride=%u layers=3 independentUV=1 rgbMult=%.3f alphaMult=%.3f nativeBase=%d nativeStart=%u rebased=1 uploadStateRestored=1 sourceRGBMod=%.0f effectiveRGBMult=%.3f nativeVS=%u material=%u restored=%u hr=%#lx",frame.id.shared,frame.id.index,vertices,frame.nativeStride+16,frame.recipe.multipliers[0],frame.recipe.multipliers[1],base,start,modulation,frame.recipe.multipliers[0]*modulation,frame.nativeKind,unsigned(materialEnabled),unsigned(restored),result);
+        WLOG_INFO("m2-particle-layers: applied=1 owner=%p emitter=%u vertices=%u stride=%u layers=3 independentUV=1 rgbMult=%.3f alphaMult=%.3f nativeBase=%d nativeStart=%u rebased=1 uploadStateRestored=1 sourceRGBMod=%.0f effectiveRGBMult=%.3f nativeVS=%u material=%u restored=%u hr=%#lx bloodSmokeApprox=%u",frame.id.shared,frame.id.index,vertices,frame.nativeStride+16,frame.recipe.multipliers[0],frame.recipe.multipliers[1],base,start,modulation,frame.recipe.multipliers[0]*modulation,frame.nativeKind,unsigned(materialEnabled),unsigned(restored),result,unsigned(frame.bloodSmoke));
     }
     if(!restored){enabled=false;WLOG_WARN("m2-particle-layers: restore failed; disabled; restart client");}
     return result;

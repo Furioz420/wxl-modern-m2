@@ -237,6 +237,12 @@ namespace
             return;
         }
 
+        if (!PadEventSlots(model, h))
+        {
+            out.fail = "event timestamp slot padding failed";
+            return;
+        }
+
         out.phase = 8; // stock shared initialize
         // --- stock shared-initialize: skin select + name-based skin load + texture handles ---
         if (!wxl::game::Native<off::M2_SharedInitializeFn>(off::kSharedInitialize)(model))

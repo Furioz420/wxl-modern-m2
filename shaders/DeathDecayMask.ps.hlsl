@@ -1,0 +1,13 @@
+// Scoped three-map approximation. Both scrolling maps follow mesh fade before
+// circular third-map coverage. Not a recovered TXAC shader.
+sampler2D firstMap : register(s0);
+sampler2D secondMap : register(s1);
+sampler2D maskMap : register(s2);
+float4 fogColour : register(c2);
+float4 main(float4 colour : COLOR0,float2 uv0:TEXCOORD0,float2 uv1:TEXCOORD1,
+            float2 maskUV:TEXCOORD2,float fog:FOG):COLOR0 {
+    float4 a=tex2D(firstMap,uv0),b=tex2D(secondMap,uv1);
+    float coverage=tex2D(maskMap,maskUV).a;
+    return float4(lerp(fogColour.rgb,colour.rgb*(a.rgb+b.rgb),fog),
+                  colour.a*(a.a+b.a)*coverage);
+}

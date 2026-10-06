@@ -4,6 +4,8 @@
 
 # wxl-modern-m2
 
+[Build compatibility and release gate](BUILDING.md)
+
 **Loads models authored for newer versions of the game, natively.**
 
 A [WarcraftXL](https://github.com/WarcraftXL/wxl-core) extension. The client's model loader only
@@ -36,7 +38,7 @@ guessing, and says so in the log.
 
 ## Building
 
-This source snapshot follows WXL integration commit `db5f1b5`. Build it with the matching core/API revision, Modern BLP support, and intended M2/DB2 data; the moving upstream `v1.1` branch is not an exact compatibility pin. The imported `.github/workflows/release.yml` publishes from `main`, so keep this PR in draft until its core pin, Hub package contents, and runtime route are validated.
+This source snapshot follows WXL integration commit `50c2f0d`. Build it with the exact core revision in [BUILDING.md](BUILDING.md), Modern BLP support, and intended M2/DB2 data. Pull requests and `main` run a Win32 build; only an explicit version tag can publish a release. Package contents and the runtime route still need validation before tagging.
 
 ## License
 
@@ -46,7 +48,7 @@ GPL-3.0-or-later. See the license header in every source file.
 
 Build `wxl-modern-m2` as a Win32 Release target against the exact core and shared M2/BLP source APIs used by this snapshot. The current workflow stages only the DLL; `wxl-modern-m2.cfg`, modern M2/skin/skeleton files, textures, and compatible DB2 catalogs are separate reviewed inputs. The modern loader can be evaluated without replacing the original Wrath model files; retail equipment and spell presentation additionally need matching data and provider services.
 
-Test one original Wrath model and one optional HD model, then inspect body textures, helmet/hair geosets, draw/sheath, shadows, and particle/ribbon effects. Run a Dalaran/Stormwind return route and inspect crash/memory logs. Keep a full DLL/config/asset rollback. The shared integration target compiles, but this large source snapshot still needs staged review, a pinned standalone build, runtime acceptance, and reconciliation with the existing WarcraftXL Modern M2 PR before release. `main` currently auto-publishes against moving upstream `v1.1`.
+Test one original Wrath model and one optional HD model, then inspect body textures, helmet/hair geosets, draw/sheath, shadows, and particle/ribbon effects. Run a Dalaran/Stormwind return route and inspect crash/memory logs. Keep a full DLL/config/asset rollback. The pinned clean-checkout target compiles, but this large source snapshot still needs staged review, runtime acceptance, and reconciliation with the existing WarcraftXL Modern M2 PR before release.
 
 ## Credits
 

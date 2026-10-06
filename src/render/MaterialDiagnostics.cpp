@@ -130,6 +130,18 @@ namespace wxl::modern::materialdiag
         }
         int RawValue(LookupValue value) noexcept { return value.available ? int(value.value) : -1; }
 
+        bool ReadSourceTexturePath(const void* owner,uint32_t index,char (&path)[192]) noexcept {
+            __try {
+                const auto* md=static_cast<const fmt::M2Header*>(owner);
+                if(!md || !md->textures.offset || md->textures.count>0x10000 || index>=md->textures.count)return false;
+                const auto& tex=reinterpret_cast<const fmt::M2Texture*>(static_cast<uintptr_t>(md->textures.offset))[index];
+                if(tex.type || !tex.filename.offset || !tex.filename.count)return false;
+                const auto* text=reinterpret_cast<const char*>(static_cast<uintptr_t>(tex.filename.offset));
+                unsigned n=0;for(;n+1<sizeof(path)&&n<tex.filename.count&&text[n];++n)path[n]=text[n];
+                path[n]=0;return true;
+            } __except(EXCEPTION_EXECUTE_HANDLER){path[0]=0;return false;}
+        }
+
         void ReportSource(uint32_t id, const Context& context)
         {
             auto source = mat::SourceMaterials().Find(context.key.owner, context.key.skin,
@@ -145,6 +157,12 @@ namespace wxl::modern::materialdiag
             const auto classification = source->ClassifySource(origin.sourceBatch);
             const bool hasMaterial = batch.materialIndex < source->model->materials.size();
             const auto flags = hasMaterial ? source->model->materials[batch.materialIndex] : mat::SourceRenderFlags{};
+            const auto& model=*source->model;
+            const bool txacKnown=model.meshTxacState==mat::MeshTxacState::Captured && batch.materialIndex<model.meshTxac.size();
+            WLOG_INFO("m2-material-probe: id=%u meshTxacState=%u meshTxacKnown=%u txac0=%u txac1=%u rawBatchFlags=%#x",
+                id,unsigned(model.meshTxacState),unsigned(txacKnown),
+                txacKnown?unsigned(model.meshTxac[batch.materialIndex][0]):0,
+                txacKnown?unsigned(model.meshTxac[batch.materialIndex][1]):0,unsigned(batch.flags));
             WLOG_INFO("m2-material-probe: id=%u sourceBatch=%u piece=%u split=%u parked=%u version=%u"
                 " profile=%u classification=%s sourceShader=%#x sourceTextures=%u material=%u"
                 " rawMaterialAvailable=%u rawFlags=%#x rawBlend=%u color=%u layer=%u",
@@ -156,6 +174,10 @@ namespace wxl::modern::materialdiag
             for (uint32_t stage = 0; stage < 4 && stage < batch.textureCount; ++stage)
             {
                 const auto s = InspectStage(*source->model, batch, stage);
+                char sourcePath[192]{};
+                const bool hasPath=s.texture.available && ReadSourceTexturePath(context.key.owner,s.texture.value,sourcePath);
+                WLOG_INFO("m2-material-probe: id=%u sourceStagePath=%u available=%u filename='%s'; descriptor only, not a sampler-binding claim",
+                    id,stage,unsigned(hasPath),sourcePath);
                 WLOG_INFO("m2-material-probe: id=%u sourceStage=%u textureIndex=%d descriptorValid=%u"
                     " type=%u flags=%#x txidAvailable=%u txid=%u coordRaw=%d weightRaw=%d transformRaw=%d",
                     id, stage, RawValue(s.texture), unsigned(s.textureValid), s.type, s.flags,
